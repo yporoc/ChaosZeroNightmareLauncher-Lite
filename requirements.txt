@@ -17,7 +17,7 @@
 curl_cffi>=0.16.3,<0.17
 
 # RSA 公钥解密 + AES-CBC 加解密（管道握手 2000 / 2001 帧）
-pycryptodome>=3.20,<4.0
+pycryptodome>=3.17,<4.0
 
 # Win32 API 绑定：命名管道、注册表、ShellExecuteExW
 pywin32>=306; sys_platform == "win32"
@@ -27,4 +27,4 @@ pywin32>=306; sys_platform == "win32"
 customtkinter>=6.0,<7.0
 
 # 二维码 png 解码与 CTkImage 渲染
-pillow>=10.0,<12.0
+pillow>=10.0,<13.0

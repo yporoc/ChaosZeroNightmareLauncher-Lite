@@ -30,7 +30,7 @@ if errorlevel 1 (
 )
 
 echo [2/3] building (this takes 1-3 minutes)...
-set ARGS=--noconfirm --clean --windowed --name czn-lite-gui --collect-all customtkinter --collect-all curl_cffi
+set ARGS=--noconfirm --clean --windowed --name czn-lite-gui --collect-all customtkinter --collect-all curl_cffi --exclude-module numpy
 if /i "%~1"=="onefile" set ARGS=%ARGS% --onefile
 py -m PyInstaller %ARGS% gui.py
 if errorlevel 1 (
