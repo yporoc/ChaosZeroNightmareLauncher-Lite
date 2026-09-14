@@ -1,0 +1,22 @@
+{
+ "game": {
+  "game_id": "STOVE_CHAOSZERO",
+  "game_no": "6583",
+  "market_game_id": "com.smilegate.chaoszero.stove.pc",
+  "install_root": "",
+  "loader_exe": "bin\\ucldr_chaoszeronightmare_gl_loader_x64.exe",
+  "loader_args": "bin\\ssr-stove-shield.exe",
+  "pipe_guid": "15BADE76-0E87-422B-A75B-B2049FE5F5F5",
+  "app_key": "def9dc2a3eac179de3ae4f54e75de3929bd56cced5ef09b0470ad66c3ec7e2da"
+ },
+ "platform": {
+  "api_base": "https://s-api.onstove.com",
+  "api": "https://api.onstove.com",
+  "client_id": "5faa0926311687ccc34a598d9640a48909a86a0e93afdf586ab088a3d01a93d3",
+  "caller_id": "STOVE_LAUNCHER_VER.3.2.28.733"
+ },
+ "gui": {
+  "github_url": "",
+  "help_text": ""
+ }
+}

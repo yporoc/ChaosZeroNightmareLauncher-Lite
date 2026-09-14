@@ -1,0 +1,30 @@
+# CZN Launcher Lite —— 运行依赖
+# ---------------------------------------------------------------------------
+# 平台：Windows 10/11 x64
+#   本项目使用 winreg / 命名管道 / ShellExecuteExW，无法在其他平台运行。
+#
+# 用法：
+#   pip install -r requirements.txt
+#   python gui.py         # 图形界面
+#   python czn_lite.py    # 控制台版（同等功能）
+#
+# 注意：打包工具 PyInstaller 不在此列 —— build.bat 打包时会自行安装，
+#       只想跑源码的人不需要它。
+# ---------------------------------------------------------------------------
+
+# HTTP 客户端。本项目依赖其 TLS 指纹模拟（impersonate）行为，
+# 该行为在不同小版本间会变化，故锁在实测的 0.16.x
+curl_cffi>=0.16.3,<0.17
+
+# RSA 公钥解密 + AES-CBC 加解密（管道握手 2000 / 2001 帧）
+pycryptodome>=3.20,<4.0
+
+# Win32 API 绑定：命名管道、注册表、ShellExecuteExW
+pywin32>=306; sys_platform == "win32"
+
+# GUI 组件库。实测 6.0.0：CTkTextbox 没有 tag_config，
+# gui.py 走的是 _textbox 内部接口兜底，不保证与 5.x 行为一致
+customtkinter>=6.0,<7.0
+
+# 二维码 png 解码与 CTkImage 渲染
+pillow>=10.0,<12.0

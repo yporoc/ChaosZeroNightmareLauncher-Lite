@@ -1,0 +1,20 @@
+# 凭据与运行时产物（绝不入库）
+state.json
+qr.png
+captcha.png
+last_required_info.json
+last_env.json
+game_stdout.log
+czn-lite-log-*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# 打包产物
+build/
+dist/
+dist_new/
+
+# PyInstaller spec 可由 build.bat 重新生成
+czn-lite-gui.spec
