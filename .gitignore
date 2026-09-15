@@ -2,6 +2,8 @@
 state.json
 qr.png
 captcha.png
+captcha_*.png
+captcha_*.jpg
 last_required_info.json
 last_env.json
 game_stdout.log

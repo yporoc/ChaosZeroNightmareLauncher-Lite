@@ -293,6 +293,32 @@ def clear_device_config():
 
 
 # ====================================================================
+# 0. 账号密码登录用的密码字段变换
+# --------------------------------------------------------------------
+# [实测 2026-09-15] signin(provider_cd="SO") 的 provider_data.password
+# 不是明文，是：AES-128-ECB(PINE key, PKCS7(utf8(pw))).hex().upper()
+#   · 与实捕值 85DF63B28F9B4E7DCDD0339EB9AA67FF 逐字符一致
+#   · 反向复算：解密该密文 -> PKCS7 自洽、8 字节、全可打印
+#     （2026-09-15 复核：正向 stove_password_field("ep666666")
+#       == 85DF63B28F9B4E7DCDD0339EB9AA67FF，双向自洽）
+# 密钥来源：IdentityLib 3.2.28 运行时提取（静态搜索全失败，不存在于本地文件）
+#   ⚠️ 版本绑定：IdentityLib 3.2.22 -> 3.2.28 时变换函数偏移已变过一次，
+#      STOVE 更新后若登录异常，需重新提取（见 docs/FINDINGS.md）。
+# ====================================================================
+PINE_ENCRYPT_KEY = "5d41037aadbc92a755ee6b86257d5ee9"
+
+
+def stove_password_field(password, pine_key=PINE_ENCRYPT_KEY):
+    """明文密码 -> 32 位大写 hex。"""
+    key = bytes.fromhex(pine_key)
+    if len(key) != 16:
+        raise ValueError("PINE key 必须是 16 字节（32 hex）")
+    data = password.encode("utf-8")
+    pad = 16 - len(data) % 16
+    return AES.new(key, AES.MODE_ECB).encrypt(data + bytes([pad]) * pad).hex().upper()
+
+
+# ====================================================================
 # 1. 认证链
 # --------------------------------------------------------------------
 # 登录与令牌兑换的完整链路（与官方启动器逐字段/逐头对齐）：
@@ -421,6 +447,34 @@ class StoveAuth:
     def signin_qr(self, qr_session):
         """扫码成功后的登录确认。"""
         return self._signin("QR", {"qr_login_session": qr_session})
+
+    # ---- 账号密码登录（provider_cd="SO"）----
+    # [反编译] "SO" 即 STOVE 账密分支（IdentityLib
+    # SigninRequest::MakeService：SO 分支写 user_id+password）。
+    # 请求体与 QR 同构，只换 provider_data。
+    # 验证码通道是 **Captcha-Token 请求头**（[实测] 不带 -> 49700；
+    # 带任意非空 -> 49703；带空串 -> 49700）。
+    #   ⚠️ 注意证据边界：上面三条只能证明「服务端把这个头当验证码凭证」，
+    #      并没有直接拍到一次"带着有效 token 且 code=0"的 signin
+    #      （抓包时已是登录态，189 条记录里零个 /sign/）。
+    #      所以「有效 token 放这里就能过」属 [推断]，见 docs/FINDINGS.md 2.3。
+    # 验证码怎么解不归本模块管，由调用方通过 captcha_token 传入（见 captcha.py）。
+    # 返回响应 dict 而**不抛异常**：49700 是需要验证码的正常中间态，不是错误。
+    def signin_password(self, user_id, password, captcha_token=None):
+        """账号密码登录。返回响应 dict；`code==49700` 表示需要验证码。"""
+        body = {"client_id": CLIENT_ID, "service_id": "Launcher",
+                "provider_cd": "SO",
+                "provider_data": {"user_id": user_id,
+                                  "password": stove_password_field(password)},
+                "gds_info": self.gds}
+        extra = {"Captcha-Token": captcha_token} if captcha_token else None
+        r = self.s.post(API_BASE + "/sign/v2.1/pc/signin", json=body,
+                        headers=self._official_headers(extra), timeout=20)
+        data = self._parse(r, "signin_so")
+        if data.get("code") in (0, None):
+            self.signin_provider_cd = "SO"
+            self._apply_launcher(data)
+        return data
 
     def _signin(self, provider_cd, provider_data):
         """登录。官方请求体不含 device_id；验证码重试走 Captcha-Token 请求头。"""

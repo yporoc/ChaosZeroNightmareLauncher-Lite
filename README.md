@@ -24,6 +24,28 @@ python gui.py          # 图形界面
 python czn_lite.py     # 控制台版
 ```
 
+## 两种登录方式
+
+| 方式 | 说明 |
+|---|---|
+| **扫码登录** | 用手机 STOVE App 扫码。**推荐**，无需输入账号密码 |
+| **账号密码登录** | 在启动器内输入 STOVE 账号密码。首次通常会要求做人机验证码 |
+
+### 关于账号密码登录
+
+STOVE 的账密登录在服务端会要求**交互式人机验证码**（点选形状 / 旋转对齐），
+启动器会弹出一个窗口让你作答。这类验证码**无法自动识别**（属于 CV 任务），
+必须人工点一下。
+
+如果验证码始终过不去，还有一个**兜底路线**：从官方 STOVE 客户端的日志里
+读取它自己登录后写下的令牌，直接用于启动游戏，**完全绕开验证码**。
+该路线需要官方客户端先登录过一次，可通过 `config.json` 的
+`captcha.forward_to_official_client` 关闭（默认开启）。
+
+> 协议细节与**哪些是实测、哪些是推断**写在
+> [`docs/FINDINGS.md`](docs/FINDINGS.md) 与 [`docs/PASSWORD_LOGIN.md`](docs/PASSWORD_LOGIN.md)，
+> 不看也不影响使用。
+
 ## 环境要求
 
 - Windows 10/11 x64
@@ -38,6 +60,7 @@ python czn_lite.py     # 控制台版
 |---|---|
 | `game.install_root` | 游戏安装目录，或用「获取离线信息」自动探测 |
 | `platform.caller_id` | 官方客户端版本串 |
+| `captcha.forward_to_official_client` | 验证码兜底路线开关，默认 `true`。设为 `false` 则只用账密登录 |
 
 `state.json` 由程序自动生成，内含登录凭据，**等同账号密码，切勿外传**。
 

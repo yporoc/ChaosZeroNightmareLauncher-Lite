@@ -18,5 +18,10 @@
  "gui": {
   "github_url": "https://github.com/yporoc/ChaosZeroNightmareLauncher-Lite",
   "help_text": "0.state.json 内含登录凭据，等同账号密码，切勿上传\n 1.本作品仅供个人学习、欣赏使用，禁止任何形式的商用、二次售卖、转载盈利。使用者使用本作品产生的一切法律纠纷、经济损失及相关责任，均由使用者自行承担，作品作者不承担任何连带责任。\n\n2.保持config.json与启动器exe在同一目录下，首次启动需获取离线信息，离线信息保存在config.json中，再点扫码登录用手机stove app扫码获取登录凭据，之后即可启动游戏"
+ },
+ "captcha": {
+  "_comment": "验证码相关。协议细节全部硬编码在 captcha.py（site_key / 端点 / 答案编码），此处只留真正会被读取的开关。",
+  "_forward_note": "true = 验证码过不去时，从官方启动器日志读取已登录令牌作为兜底。前提是官方客户端登录过一次。设为 false 则关闭该兜底，只走纯账密。",
+  "forward_to_official_client": true
  }
 }
