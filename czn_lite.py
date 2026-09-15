@@ -293,6 +293,27 @@ def clear_device_config():
 
 
 # ====================================================================
+# 0. 账号密码登录用的密码字段变换
+# --------------------------------------------------------------------
+# signin(provider_cd="SO") 的 provider_data.password 不是明文，而是：
+#     AES-128-ECB(PINE_KEY, PKCS7(utf8(pw))).hex().upper()
+# 密钥来自 IdentityLib 3.2.28 运行时提取。它与库版本绑定，
+# STOVE 更新后若登录异常需重新提取。
+# ====================================================================
+PINE_ENCRYPT_KEY = "5d41037aadbc92a755ee6b86257d5ee9"
+
+
+def stove_password_field(password, pine_key=PINE_ENCRYPT_KEY):
+    """明文密码 -> 32 位大写 hex。"""
+    key = bytes.fromhex(pine_key)
+    if len(key) != 16:
+        raise ValueError("PINE key 必须是 16 字节（32 hex）")
+    data = password.encode("utf-8")
+    pad = 16 - len(data) % 16
+    return AES.new(key, AES.MODE_ECB).encrypt(data + bytes([pad]) * pad).hex().upper()
+
+
+# ====================================================================
 # 1. 认证链
 # --------------------------------------------------------------------
 # 登录与令牌兑换的完整链路（与官方启动器逐字段/逐头对齐）：
@@ -421,6 +442,26 @@ class StoveAuth:
     def signin_qr(self, qr_session):
         """扫码成功后的登录确认。"""
         return self._signin("QR", {"qr_login_session": qr_session})
+
+    # ---- 账号密码登录（provider_cd="SO"）----
+    # 请求体与扫码同构，只换 provider_data。
+    # 验证码 token 走 `Captcha-Token` 请求头；怎么拿 token 由 captcha.py 负责。
+    # 返回响应 dict 而不抛异常：49700 表示需要验证码，是正常中间态。
+    def signin_password(self, user_id, password, captcha_token=None):
+        """账号密码登录。返回响应 dict；`code==49700` 表示需要验证码。"""
+        body = {"client_id": CLIENT_ID, "service_id": "Launcher",
+                "provider_cd": "SO",
+                "provider_data": {"user_id": user_id,
+                                  "password": stove_password_field(password)},
+                "gds_info": self.gds}
+        extra = {"Captcha-Token": captcha_token} if captcha_token else None
+        r = self.s.post(API_BASE + "/sign/v2.1/pc/signin", json=body,
+                        headers=self._official_headers(extra), timeout=20)
+        data = self._parse(r, "signin_so")
+        if data.get("code") in (0, None):
+            self.signin_provider_cd = "SO"
+            self._apply_launcher(data)
+        return data
 
     def _signin(self, provider_cd, provider_data):
         """登录。官方请求体不含 device_id；验证码重试走 Captcha-Token 请求头。"""
