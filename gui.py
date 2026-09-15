@@ -186,7 +186,7 @@ class App(ctk.CTk):
         qr.grid_propagate(False)
         qr.grid_columnconfigure(0, weight=1)
         qr.grid_columnconfigure(1, weight=1)
-        qr.grid_rowconfigure(4, weight=1)        # QR 图像区吃掉余量
+        qr.grid_rowconfigure(5, weight=1)        # QR 图像区吃掉余量
         self.qr_panel = qr
 
         self.btn = {}
@@ -215,20 +215,28 @@ class App(ctk.CTk):
         _small("qrcode",  "扫码登录",  lambda: self._run_task(self._task_qrlogin), 3, 1)
         qr.grid_columnconfigure(1, weight=1)
 
+        # ★ 账号密码登录（整行；二维码区因此下移到 5/6 行）
+        _b = ctk.CTkButton(qr, text="账号密码登录",
+                           command=lambda: self._run_task(self._task_pwdlogin),
+                           height=36, font=ui_font, fg_color=C_BTN,
+                           hover_color=C_BTN_HOV, corner_radius=8)
+        _b.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14, pady=2)
+        self.btn["pwd"] = _b
+
         # 图像标签: 无文件=完全空白; 尺寸动态适配不写死
         # (旧"扫码登录"文字标题已删 —— 与同名按钮重复, 纯困惑)
         # ★ columnspan=2: 必须跨满两列, 否则二维码被挤进半列宽(实测 217px 缩水)
         self.qr_label = ctk.CTkLabel(qr, text="", fg_color="transparent")
         # 二维码遮罩: 只盖图片区, 不影响上方按钮
         self.qr_cover = ctk.CTkFrame(qr, fg_color="#000000", corner_radius=0)
-        self.qr_label.grid(row=4, column=0, columnspan=2, padx=12,
+        self.qr_label.grid(row=5, column=0, columnspan=2, padx=12,
                            pady=(4, 2), sticky="nsew")
         self.qr_label.bind("<Button-1>", self._on_qr_click)   # 点击→打开本地 png
         self.qr_label.bind("<Configure>", self._on_qr_panel_resize)  # 尺寸自校正
         ctk.CTkLabel(qr, text="点击二维码打开本地png",   # 短文案, 防两侧截断
                      font=ctk.CTkFont("Microsoft YaHei UI", 11),
                      text_color=C_DIM, wraplength=272,
-                     justify="center").grid(row=5, column=0, columnspan=2,
+                     justify="center").grid(row=6, column=0, columnspan=2,
                                             pady=(4, 12))
         qr.bind("<Configure>", self._on_qr_panel_resize)
 
@@ -551,6 +559,151 @@ class App(ctk.CTk):
         self.log_line("[+] 扫码登录成功 member_no=%s guid=%s(启动器级) nickname=%s"
                       % (auth.member_no, auth.guid, auth.nickname))
         self.set_status("状态: 已登录 (扫码)")
+
+    # ---- 任务 2b: 账号密码登录 ----
+    # 验证码无法自动解（click 点选 + rotate 旋转，都是 CV 任务），
+    # 因此弹交互窗口由用户作答；协议细节见 captcha.py。
+    def _ui_sync(self, fn):
+        """worker 线程里调用：切到 UI 线程执行并等返回值。
+
+        Tk 控件只能在 UI 线程碰，而任务跑在 worker 线程，必须这样桥接。
+        """
+        box, done = {}, threading.Event()
+
+        def run():
+            try:
+                box["v"] = fn()
+            except Exception as e:
+                self.log_line("[x] UI 操作异常: %s" % e)
+                box["v"] = None
+            finally:
+                done.set()
+
+        self.after(0, run)
+        done.wait()
+        return box.get("v")
+
+    def _dialog_credentials(self):
+        """UI 线程：弹账号密码输入框，返回 (user_id, password) 或 None。"""
+        win = ctk.CTkToplevel(self)
+        win.title("账号密码登录")
+        win.geometry("440x250")
+        win.minsize(380, 230)
+        win.configure(fg_color=C_BG)
+        win.transient(self)
+        win.grab_set()
+        win.after(120, win.lift)
+        box = {"v": None}
+        f = ctk.CTkFont("Microsoft YaHei UI", 12)
+
+        ctk.CTkLabel(win, text="STOVE 账号（邮箱）", text_color=C_DIM,
+                     font=f).pack(anchor="w", padx=22, pady=(20, 2))
+        e_uid = ctk.CTkEntry(win, width=396, height=34, font=f)
+        e_uid.pack(padx=22)
+
+        ctk.CTkLabel(win, text="密码", text_color=C_DIM,
+                     font=f).pack(anchor="w", padx=22, pady=(12, 2))
+        e_pwd = ctk.CTkEntry(win, width=396, height=34, font=f, show="●")
+        e_pwd.pack(padx=22)
+
+        def ok(_e=None):
+            u = e_uid.get().strip()
+            p = e_pwd.get()
+            if not u or not p:
+                return
+            box["v"] = (u, p)
+            win.grab_release()
+            win.destroy()
+
+        def cancel():
+            win.grab_release()
+            win.destroy()
+
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill="x", padx=22, pady=(18, 0))
+        ctk.CTkButton(bar, text="取消", width=84, fg_color=C_BTN,
+                      hover_color=C_BTN_HOV, command=cancel).pack(side="right")
+        ctk.CTkButton(bar, text="登录", width=110, fg_color=C_ACCENT,
+                      hover_color=C_ACCENT_HV, command=ok).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", ok)
+        e_uid.focus_set()
+        self.wait_window(win)
+        return box["v"]
+
+    def _show_captcha(self, step):
+        """UI 线程：显示一步验证码，返回 base64 答案。"""
+        try:
+            from captcha_ui import CaptchaWindow
+        except Exception as e:
+            self.log_line("[x] 验证码窗口不可用: %s" % e)
+            return None
+        w = CaptchaWindow(self, step)
+        self.wait_window(w)
+        return w.result
+
+    def _task_pwdlogin(self):
+        self.log_line("[*] 账号密码登录（provider_cd=SO）")
+        creds = self._ui_sync(self._dialog_credentials)
+        if not creds:
+            self.log_line("[*] 已取消")
+            self.set_status("状态: 就绪")
+            return
+        uid, pwd = creds
+
+        auth = cl.StoveAuth()
+        self.set_status("状态: 账号密码登录中…")
+        data = auth.signin_password(uid, pwd)
+        code = data.get("code")
+
+        if code in (0, None):
+            self._pwdlogin_done(auth)
+            return
+        if code != 49700:
+            self.log_line("[x] 登录失败 code=%s msg=%s"
+                          % (code, data.get("message")))
+            self.set_status("状态: 登录失败")
+            return
+
+        # ---- 49700：需要验证码 ----
+        self.log_line("[!] 服务端要求验证码（49700）—— 弹出验证码窗口")
+        self.set_status("状态: 等待验证码…")
+        try:
+            import captcha as cap
+        except Exception as e:
+            self.log_line("[x] 验证码模块不可用: %s" % e)
+            self.set_status("状态: 验证码模块缺失")
+            return
+
+        token = cap.solve_login_captcha(auth, ui_ask=self._show_captcha_1,
+                                        on_event=self.log_line)
+        if not token:
+            self.log_line("[x] 验证码未通过")
+            self.set_status("状态: 验证码未通过")
+            return
+
+        self.log_line("[*] 拿到验证码 token（%d 字符），重试登录…" % len(token))
+        data2 = auth.signin_password(uid, pwd, captcha_token=token)
+        code2 = data2.get("code")
+        if code2 in (0, None):
+            self._pwdlogin_done(auth)
+            return
+        self.log_line("[x] 带验证码仍失败 code=%s msg=%s"
+                      % (code2, data2.get("message")))
+        if code2 == 49703:
+            self.log_line("    code=49703 = captcha token is not valid")
+            self.log_line("    ⇒ token 未被接受：可能头名不对，或已过期/被消费")
+        self.set_status("状态: 登录失败")
+
+    def _show_captcha_1(self, step):
+        """worker 线程里被 captcha 模块调用：转交 UI 线程显示。"""
+        return self._ui_sync(lambda: self._show_captcha(step))
+
+    def _pwdlogin_done(self, auth):
+        auth.save()
+        self.log_line("[+] 账号密码登录成功 member_no=%s guid=%s(启动器级) nickname=%s"
+                      % (auth.member_no, auth.guid, auth.nickname))
+        self.log_line("[dbg] 凭据已写回 state.json")
+        self.set_status("状态: 已登录 (账密)")
 
     # ---- 任务 3: 启动游戏(全流程一键) ----
     def _task_launch(self):
