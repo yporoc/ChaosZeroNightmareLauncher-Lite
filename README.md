@@ -43,8 +43,8 @@ python czn_lite.py     # 控制台版
 
 ## 构建
 
-```bat
-build.bat
+```
+双击运行build.bat
 ```
 
 ## 许可
