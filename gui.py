@@ -272,6 +272,8 @@ class App(ctk.CTk):
         self.log_line("[dbg] config      : %s"
                       % (cl._CONFIG_FILE if cl._CONFIG_FILE.exists()
                          else "(仅内置默认值)"))
+        for _n in cl.CONFIG_NOTES:
+            self.log_line("[!] 配置: %s" % _n)
         self.log_line("[dbg]   install_root: %s"
                       % (cl.INSTALL_ROOT or "未配置 —— 点『获取离线信息』自动探测"))
         self.log_line("[dbg] state.json : %s (凭据 + 设备信息; 删除它 = 退出登录)"
@@ -502,7 +504,7 @@ class App(ctk.CTk):
                 has_rt = bool(_st.get("launcher_refresh"))
             except Exception as e:
                 self.log_line("[dbg]   state.json 读取失败: %s" % e)
-        loader_ok = os.path.exists(cl.LOADER_EXE)
+        loader_ok = cl.loader_probe(cl.INSTALL_ROOT)[0]
         self.log_line("[*] 前置条件检查:")
         self.log_line("[dbg]   state.json    : %s" % ("存在" if st_ok else "缺失"))
         self.log_line("[dbg]   refresh_token : %s"
@@ -825,6 +827,11 @@ class App(ctk.CTk):
         if "install_root_detected" in info and not info.get("loader_found"):
             # ★ 换设备自主适配: 探测到安装路径 → 写入 config.json 并即时生效
             root = info["install_root_detected"]
+            if not root:
+                self.log_line("[x] 未能定位游戏目录 —— 请手动修改 config.json 的 "
+                              "game.install_root（填包含 bin 子目录的那一层）")
+                self.set_status("状态: 未找到游戏目录")
+                return
             self.log_line("[*] 检测到安装路径: %s —— 写入 config.json" % root)
             try:
                 cl.set_install_root(root)
