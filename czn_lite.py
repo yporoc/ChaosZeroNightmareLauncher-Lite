@@ -33,6 +33,7 @@ import base64
 import ctypes
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -72,13 +73,128 @@ def _find_config_file():
 
 
 _CONFIG_FILE = _find_config_file()
+
+# 配置读取诊断。窗口模式 exe 没有控制台，print 出去的报错用户根本看不见 ——
+# 于是「配置坏了」在用户侧永远表现为「找不到路径」。必须收集起来供界面显示。
+CONFIG_NOTES = []
+
+
+def _decode_config(raw):
+    """config.json 字节 -> 文本。
+
+    utf-8-sig 排第一是为了吃掉 BOM：记事本保存会加 BOM，
+    而标准 json.loads 遇到 BOM 会直接抛 JSONDecodeError。
+    """
+    for enc in ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            if enc != "utf-8-sig":
+                CONFIG_NOTES.append("配置以 %s 编码解码" % enc)
+            return text
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+_LONE_ESCAPE = re.compile(r"(?<!\\)\\(?!\\)")      # 单独的反斜杠（前后都不是）
+
+
+def _repair_path_values(text):
+    """把「路径类键」的值按字面反斜杠重新转义。
+
+    JSON 里 \\b \\f \\n \\r \\t 都是**合法**转义，用户手写的 `D:\\bin` 会被
+    静默解析成 `D:<退格>in`。这里只补单独的反斜杠（已配对的 \\\\ 不动），
+    因此可无条件先跑；只动已知路径键，help_text 里的 \\n 绝不能碰。
+    """
+    keys = ("install_root", "loader_exe", "loader_args", "game_path",
+            "install_path", "path", "working_dir")
+    pat = re.compile(r'"(%s)"(\s*:\s*)"([^"]*)"' % "|".join(keys))
+
+    def _fix(m):
+        key, sep, val = m.group(1), m.group(2), m.group(3)
+        # 替换串里的 "\\\\" 只表示一个反斜杠，必须用 lambda 才能返回两个
+        return '"%s"%s"%s"' % (key, sep,
+                               _LONE_ESCAPE.sub(lambda _m: "\\\\", val))
+
+    return pat.sub(_fix, text)
+
+
+def _loads_config(text):
+    """解析配置文本，容忍手工编辑的常见错误。
+
+    逐级尝试，任一级成功即返回，每级都在 CONFIG_NOTES 留痕。
+    路径键规范化排最前：\\b \\t 这类合法转义原样解析会「成功」却改坏路径。
+    """
+
+    def _try(candidate):
+        try:
+            return json.loads(candidate), None
+        except Exception as e:
+            return None, e
+
+    repaired = _repair_path_values(text)
+    no_comma = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    # 1) 路径键按字面反斜杠规范化
+    if repaired != text:
+        data, err = _try(repaired)
+        if data is not None:
+            CONFIG_NOTES.append("已自动修复：路径键里的单反斜杠按字面处理")
+            return data
+        CONFIG_NOTES.append("路径键规范化后仍失败：%s" % err)
+
+    # 2) 原样
+    data, err = _try(text)
+    if data is not None:
+        return data
+    CONFIG_NOTES.append("严格解析失败：%s" % err)
+
+    # 3) 只去尾逗号
+    if no_comma != text:
+        data, err = _try(no_comma)
+        if data is not None:
+            CONFIG_NOTES.append("已自动修复：去掉多余的尾逗号")
+            return data
+        CONFIG_NOTES.append("去尾逗号后仍失败：%s" % err)
+
+    # 4) 路径键规范化 + 去尾逗号
+    if repaired != text:
+        both = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        if both != repaired:
+            data, err = _try(both)
+            if data is not None:
+                CONFIG_NOTES.append("已自动修复：单反斜杠 + 多余的尾逗号")
+                return data
+            CONFIG_NOTES.append("路径键规范化+去尾逗号后仍失败：%s" % err)
+
+    # 5) 通用非法转义修复（非路径键也可能写坏）
+    generic = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', repaired)
+    if generic != repaired:
+        data, err = _try(generic)
+        if data is not None:
+            CONFIG_NOTES.append("已自动修复：非法转义序列")
+            return data
+        CONFIG_NOTES.append("通用修复后仍失败：%s" % err)
+
+    return None
+
+
 try:
-    _CONFIG = json.loads(_CONFIG_FILE.read_text(encoding="utf-8")) \
-        if _CONFIG_FILE.exists() else {}
-    if not isinstance(_CONFIG, dict):
+    if _CONFIG_FILE.exists():
+        _raw = _CONFIG_FILE.read_bytes()
+        _text = _decode_config(_raw)
+        _CONFIG = _loads_config(_text) if _text else None
+        if _CONFIG is None:
+            CONFIG_NOTES.append("配置无法解析，已退化为内置默认值")
+            _CONFIG = {}
+        elif not isinstance(_CONFIG, dict):
+            CONFIG_NOTES.append("配置顶层不是 JSON 对象，已忽略")
+            _CONFIG = {}
+    else:
+        CONFIG_NOTES.append("未找到 config.json：%s" % _CONFIG_FILE)
         _CONFIG = {}
 except Exception as e:
-    print("[!] config.json 读取失败（%s），使用内置默认值" % e)
+    CONFIG_NOTES.append("读取 config.json 异常：%r" % (e,))
     _CONFIG = {}
 
 
@@ -113,8 +229,79 @@ LOADER_REL = _cfg("game", "loader_exe",
                   default=r"bin\ucldr_chaoszeronightmare_gl_loader_x64.exe")
 LOADER_ARGS = _cfg("game", "loader_args", default=r"bin\ssr-stove-shield.exe")
 
+# ---- 路径规范化与校验 ----
+# 用户填 install_root 的方式千奇百怪：正斜杠、尾部多一个反斜杠、带引号、
+# 指到 bin 子目录、甚至直接指到 loader exe。这里统一收敛成「游戏根目录」。
+def normalize_install_root(raw, loader_rel=LOADER_REL):
+    """把各种写法统一成游戏根目录。返回 (路径, 说明列表)。"""
+    notes = []
+    if not raw:
+        return "", notes
+    s = str(raw).strip().strip('"').strip("'").strip()
+    if not s:
+        return "", notes
+    if s != str(raw).strip():
+        notes.append("去掉首尾空白/引号：%r -> %r" % (raw, s))
+    s = os.path.expandvars(os.path.expanduser(s))
+    if "/" in s:
+        notes.append("正斜杠已转为反斜杠")
+        s = s.replace("/", "\\")
+
+    if s.lower().endswith(".exe"):
+        notes.append("指向了 exe 文件，上跳两级取游戏根")
+        s = os.path.dirname(os.path.dirname(s))
+    elif os.path.basename(s.rstrip("\\/")).lower() == "bin":
+        notes.append("指向了 bin 目录，上跳一级取游戏根")
+        # 先去掉尾部分隔符再 dirname —— 否则 "...\bin\" 只会被削成 "...\bin"
+        s = os.path.dirname(s.rstrip("\\/"))
+
+    norm = os.path.normpath(s)
+    if norm != s:
+        notes.append("normpath：%r -> %r" % (s, norm))
+    return norm, notes
+
+
+def loader_probe(root, loader_rel=LOADER_REL):
+    """检查 root 下是否有 loader。返回 (是否存在, 完整路径)。
+
+    用精确路径即可 —— Windows 文件系统不区分大小写：实测官方文件名是
+    `ucldr_ChaosZeroNightmare_GL_loader_x64.exe`，与 config 默认值的大小写
+    不同，但 os.path.exists 仍能命中。
+    """
+    if not root:
+        return False, "install_root 为空"
+    exe = os.path.join(root, loader_rel)
+    return os.path.exists(exe), exe
+
+
+def detect_install_root_from_registry():
+    """从注册表取官方记录的安装路径（权威来源）。
+
+    官方安装器写在 HKCU\\SOFTWARE\\SGUP\\apps\\<GAME_ID>\\GamePath。
+    比全盘盲扫可靠：不受盘符、目录层级、文件夹改名影响。
+    返回 (路径, 说明)。
+    """
+    if os.name != "nt":
+        return "", "非 Windows 环境"
+    sub = r"SOFTWARE\SGUP\apps\%s" % GAME_ID
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub) as key:
+            gp, _ = winreg.QueryValueEx(key, "GamePath")
+    except OSError as e:
+        return "", "注册表 %s 读取失败：%s" % (sub, e)
+    if not gp:
+        return "", "注册表 GamePath 为空"
+    gp, _n = normalize_install_root(gp)
+    ok, detail = loader_probe(gp)
+    if ok:
+        return gp, "注册表 %s\\GamePath" % sub
+    return "", "注册表 GamePath=%r 下未找到 loader（%s）" % (gp, detail)
+
+
 # ---- 本机动态值（换设备会变，源码不给默认值） ----
-INSTALL_ROOT = _cfg("game", "install_root", default="")
+INSTALL_ROOT_RAW = _cfg("game", "install_root", default="")
+INSTALL_ROOT, _ROOT_NOTES = normalize_install_root(INSTALL_ROOT_RAW)
+CONFIG_NOTES.extend(_ROOT_NOTES)
 LOADER_EXE = os.path.join(INSTALL_ROOT, LOADER_REL) if INSTALL_ROOT else LOADER_REL
 
 # 账号服务区（gds）：官方上报的是它检测到的出口地区；直连场景下没有
@@ -250,40 +437,88 @@ def collect_local_info():
     info["install_root"] = INSTALL_ROOT
     info["loader_found"] = os.path.exists(LOADER_EXE)
     if not info["loader_found"]:
-        import glob
-        for drive in ("C:", "D:", "E:", "F:"):
-            patterns = [
-                drive + r"\ChaosZeroNightmare\bin\ucldr_*.exe",
-                drive + r"\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
-                drive + r"\Games\*\bin\ucldr_chaos*.exe",
-                drive + r"\*\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
-            ]
-            for pattern in patterns:
-                hits = glob.glob(pattern)
-                if hits:
-                    detected = os.path.dirname(os.path.dirname(hits[0]))
-                    info["install_root_detected"] = detected
-                    break
-            if "install_root_detected" in info:
-                break
+        detected, trace = detect_install_root()
+        if not detected:
+            trace.append("全部失败 —— 需在 config.json 里设置 game.install_root")
+        info["install_root_detected"] = detected
+        info["detect_trace"] = trace
     return info
+
+
+def detect_install_root():
+    """定位游戏安装目录。返回 (路径 或 "", 轨迹列表)。
+
+    顺序（可靠性由高到低）：
+      1. 注册表 apps\\<GAME_ID>\\GamePath —— 官方写入，权威
+      2. 常见层级的有界探测 —— 兜底，覆盖有限
+    每一步都记录轨迹，失败时能看清「试过什么、为什么没中」。
+    """
+    import glob
+    trace = []
+
+    # ① 注册表（权威）
+    reg_path, reg_note = detect_install_root_from_registry()
+    trace.append("注册表: %s" % reg_note)
+    if reg_path:
+        return reg_path, trace
+
+    # ② 有界探测：盘符 + 层级都放宽，并逐条记录
+    drives = []
+    for letter in "CDEFGHIJ":
+        d = letter + ":\\"
+        if os.path.exists(d):
+            drives.append(letter + ":")
+    trace.append("可用盘符: %s" % drives)
+
+    patterns = [
+        r"{d}\ChaosZeroNightmare\bin\ucldr_*.exe",
+        r"{d}\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
+        r"{d}\Games\*\bin\ucldr_chaos*.exe",
+        r"{d}\*\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
+        r"{d}\*\*\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
+        r"{d}\*\Games\*\bin\ucldr_*.exe",
+        r"{d}\Games\*\*\bin\ucldr_*.exe",
+        r"{d}\SteamLibrary\steamapps\common\ChaosZeroNightmare\bin\ucldr_*.exe",
+    ]
+    for tpl in patterns:
+        for d in drives:
+            pat = tpl.format(d=d)
+            try:
+                hits = glob.glob(pat)
+            except Exception as e:
+                trace.append("异常 %s -> %r" % (pat, e))
+                continue
+            if hits:
+                found = os.path.dirname(os.path.dirname(hits[0]))
+                trace.append("命中 %s -> %s" % (pat, found))
+                return found, trace
+    trace.append("探测模式全部未命中（共 %d 条 × %d 盘符）"
+                 % (len(patterns), len(drives)))
+    return "", trace
 
 
 def set_install_root(root):
     """把本机安装路径写入 config.json 并即时生效（换设备自主适配）。
-    只修改 game.install_root 一个键，其余配置保持不变。"""
+    只修改 game.install_root 一个键，其余配置保持不变。
+    写入前先规范化，避免把 bin/ 或 exe 这种错误层级存进去。"""
+    root, _notes = normalize_install_root(root)
+    # 必须走容错链读取：否则配置有语法错时会把其余键全部丢掉（用户配置被清空）
     data = {}
     if _CONFIG_FILE.exists():
         try:
-            data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
+            data = _loads_config(
+                _decode_config(_CONFIG_FILE.read_bytes()) or "") or {}
+        except OSError:
             data = {}
+    if not isinstance(data, dict):
+        data = {}
     data.setdefault("game", {})["install_root"] = root
     _CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     global INSTALL_ROOT, LOADER_EXE
     INSTALL_ROOT = root
-    LOADER_EXE = os.path.join(root, LOADER_REL)
+    LOADER_EXE = os.path.join(root, LOADER_REL) if root else LOADER_REL
+    return root
 
 
 def clear_device_config():
@@ -1160,6 +1395,21 @@ def launch_game(env, wait_seconds=12):
       · 超时后检查 loader/游戏是否其实已经启动（避免双开）
       · 确认未启动则回退 CreateProcessW 直启（不会阻塞）
     失败时打印 Win32 错误码便于定位。"""
+    # 前置校验：路径不对时立刻给出可读原因，而不是抛 WinError 123
+    ok, detail = loader_probe(INSTALL_ROOT, LOADER_REL)
+    if not ok:
+        print("[x] 无法拉起：游戏目录未配置或 loader 不存在")
+        print("    install_root = %r" % INSTALL_ROOT)
+        print("    期望 loader  = %s" % detail)
+        if INSTALL_ROOT:
+            print("    该目录存在   = %s" % os.path.isdir(INSTALL_ROOT))
+            print("    其下 bin     = %s"
+                  % os.path.isdir(os.path.join(INSTALL_ROOT, "bin")))
+        else:
+            print("    提示：请在 config.json 里设置 game.install_root"
+                  "（填包含 bin 子目录的那一层）。")
+        return False
+
     for key, value in env.items():
         if value is not None:
             os.environ[key] = str(value)
@@ -1203,7 +1453,9 @@ def launch_game(env, wait_seconds=12):
             return True
 
     try:
-        process = subprocess.Popen([LOADER_EXE, LOADER_ARGS], cwd=INSTALL_ROOT)
+        # cwd 必须是非空有效目录：空串会抛 OSError WinError 123
+        process = subprocess.Popen([LOADER_EXE, LOADER_ARGS],
+                                   cwd=INSTALL_ROOT or None)
         print("[launch] 游戏进程已创建（CreateProcessW，pid=%s）" % process.pid)
         return True
     except Exception as e:
@@ -1221,7 +1473,8 @@ def launch_game_capture_stdout(env, out_path=None):
     out_path = out_path or str(Path(__file__).with_name("game_stdout.log"))
     log = open(out_path, "wb")
     print("[launch] 诊断模式：stdout/stderr → %s" % out_path)
-    process = subprocess.Popen([LOADER_EXE, LOADER_ARGS], cwd=INSTALL_ROOT,
+    process = subprocess.Popen([LOADER_EXE, LOADER_ARGS],
+                               cwd=INSTALL_ROOT or None,
                                stdout=log, stderr=subprocess.STDOUT,
                                stdin=subprocess.DEVNULL)
     print("[launch] loader pid=%s" % process.pid)
