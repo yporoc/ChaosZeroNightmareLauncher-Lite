@@ -28,6 +28,7 @@ r"""czn-lite 图形界面（customtkinter，暗色模式）
 打包：build.bat（PyInstaller，依赖全内嵌）
 """
 import base64
+import ctypes
 import io
 import json
 import os
@@ -37,6 +38,7 @@ import threading
 import time
 import contextlib
 import customtkinter as ctk
+from ctypes import wintypes
 from pathlib import Path
 
 import czn_lite as cl          # ← 真逻辑本体(同一目录)
@@ -93,6 +95,122 @@ class _LineWriter(io.TextIOBase):
         return False
 
 
+# ==================== 托盘（可选，默认关闭；零新依赖） ====================
+# 纯 pywin32：自建隐藏窗口 + Shell_NotifyIcon。已实测 Tk 的 mainloop 会分发
+# 该窗口的消息，所以不需要额外的消息泵，也不需要 pystray 这类新依赖。
+class _NOTIFYICONDATA(ctypes.Structure):
+    """Shell_NotifyIcon 入参结构（V3）。"""
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128), ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD), ("szInfo", wintypes.WCHAR * 256),
+                ("uVersion", wintypes.UINT), ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wintypes.HICON)]
+
+
+class _Tray:
+    """托盘图标。只负责显示图标与接收点击，不含任何业务逻辑。
+
+    ★★ 铁律：WndProc 里**绝对不能调用任何 Tk 方法**。
+    Tk 的 mainloop 在阻塞等待消息时会释放 GIL；Windows 正好在这个窗口把托盘
+    消息派发进来，pywin32 便带着 NULL 线程状态去执行 Python —— 一旦此时调用
+    Tk（哪怕是 app.after），就会触发
+        Fatal Python error: PyEval_RestoreThread: ... (the current Python
+        thread state is NULL)
+    进程直接死。已实测：只跑纯 Python 安全，调用 Tk 必崩。
+    所以这里只把「意图」塞进 pending 队列，由 GUI 的 _pump 在正常事件循环里执行。
+    """
+
+    _WM_CB = 0x8000 + 1                 # WM_APP + 1
+    _ID = 1
+    _CLASS = "CznLiteTrayWnd"
+    _NIM_ADD, _NIM_MODIFY, _NIM_DELETE = 0, 1, 2
+    _NIF_MESSAGE, _NIF_ICON, _NIF_TIP, _NIF_INFO = 0x1, 0x2, 0x4, 0x10
+    _WM_LBUTTONUP, _WM_RBUTTONUP, _WM_LBUTTONDBLCLK = 0x0202, 0x0205, 0x0203
+
+    def __init__(self, tooltip="CZN Launcher Lite"):
+        import win32api
+        import win32gui
+        self._gui = win32gui
+        self._shell = ctypes.windll.shell32
+        self._tooltip = tooltip
+        self._visible = False
+        self._hicon = None
+        self.pending = queue.Queue()    # WndProc -> GUI 事件循环的意图队列
+
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = win32api.GetModuleHandle(None)
+        wc.lpszClassName = self._CLASS
+        wc.lpfnWndProc = self._wndproc
+        try:
+            win32gui.RegisterClass(wc)
+        except Exception:
+            pass                        # 重复创建时类已存在
+        self._hwnd = win32gui.CreateWindow(self._CLASS, "czn-lite-tray", 0,
+                                           0, 0, 0, 0, 0, 0, wc.hInstance, None)
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        # ★ 这里只允许纯 Python：入队即返回，绝不触碰 Tk（见类文档）
+        if msg == self._WM_CB:
+            if lparam in (self._WM_LBUTTONUP, self._WM_LBUTTONDBLCLK):
+                self.pending.put("restore")
+            elif lparam == self._WM_RBUTTONUP:
+                self.pending.put("menu")
+        return self._gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _icon(self):
+        if self._hicon is None:
+            import win32con
+            self._hicon = self._gui.LoadIcon(0, win32con.IDI_APPLICATION)
+        return self._hicon
+
+    def _data(self, tip=None, info=None, title=None):
+        nid = _NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATA)
+        nid.hWnd = self._hwnd
+        nid.uID = self._ID
+        nid.uFlags = self._NIF_MESSAGE | self._NIF_ICON | self._NIF_TIP
+        nid.uCallbackMessage = self._WM_CB
+        nid.hIcon = self._icon()
+        nid.szTip = (tip or self._tooltip)[:127]
+        if info:
+            nid.uFlags |= self._NIF_INFO
+            nid.szInfo = info[:255]
+            nid.szInfoTitle = (title or self._tooltip)[:63]
+            nid.dwInfoFlags = 0x1       # NIIF_INFO
+        return nid
+
+    def show(self, tip=None, info=None, title=None):
+        """加/改图标。info 非空时顺带弹一次气泡提示。"""
+        op = self._NIM_MODIFY if self._visible else self._NIM_ADD
+        ok = bool(self._shell.Shell_NotifyIconW(op,
+                                                ctypes.byref(self._data(tip, info, title))))
+        self._visible = ok or self._visible
+        return ok
+
+    def set_tip(self, tip):
+        if self._visible:
+            self.show(tip=tip)
+
+    def hide(self):
+        if self._visible:
+            self._shell.Shell_NotifyIconW(self._NIM_DELETE,
+                                          ctypes.byref(self._data()))
+            self._visible = False
+
+    def destroy(self):
+        """★ 必须先 NIM_DELETE 再销毁窗口，否则托盘里会留下死图标。"""
+        self.hide()
+        if self._hwnd:
+            try:
+                self._gui.DestroyWindow(self._hwnd)
+            except Exception:
+                pass
+            self._hwnd = None
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -105,8 +223,11 @@ class App(ctk.CTk):
         self._qr_rendered = None        # 最近一次实际渲染的尺寸(防 Configure 循环)
         self._qr_job = None             # 缩放防抖 after 句柄
         self._in_game = False           # 游戏管道会话进行中(handshake_done)
+        self._tray = None               # 托盘（默认不启用）
+        self._tray_menu = None          # 托盘右键菜单（需长期持有，见 _tray_popup）
         self.var_log = ctk.BooleanVar(value=True)   # 日志窗显示开关
         self.var_qr = ctk.BooleanVar(value=True)    # 二维码面板显示开关
+        self.var_tray = ctk.BooleanVar(value=False)  # 托盘模式开关（默认关）
 
         self.title("ChaosZeroNightmareLauncher-Lite 卡厄斯梦境极简启动器")
         self.geometry("1180x700")
@@ -115,6 +236,7 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)   # 日志列伸缩; QR 列固定宽
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        cl.EVENT_SINK = self._on_event      # 结构化事件实时上屏
         self._build_ui()
         self.after(40, self._pump)
         self._welcome()
@@ -162,6 +284,12 @@ class App(ctk.CTk):
             width=64, height=30, font=ctk.CTkFont("Microsoft YaHei UI", 12),
             fg_color=C_ACCENT, hover_color=C_ACCENT_HV, corner_radius=8)
         self.chk_log.pack(side="right")
+        # 托盘开关：默认不勾；勾选=启用托盘模式（需一次确认），决不默认
+        self.chk_tray = ctk.CTkCheckBox(
+            top, text="托盘", variable=self.var_tray, command=self._toggle_tray,
+            width=64, height=30, font=ctk.CTkFont("Microsoft YaHei UI", 12),
+            fg_color=C_ACCENT, hover_color=C_ACCENT_HV, corner_radius=8)
+        self.chk_tray.pack(side="right")
 
         # ---- 内容区: 左日志(伸缩) + 右控制/QR 面板(固定宽) ----
         self.log = ctk.CTkTextbox(
@@ -240,13 +368,21 @@ class App(ctk.CTk):
                                             pady=(4, 12))
         qr.bind("<Configure>", self._on_qr_panel_resize)
 
-        # ---- 状态栏 ----
-        self.status = ctk.CTkLabel(self, text="状态: 就绪", anchor="w",
-                                   fg_color=C_PANEL, corner_radius=8,
-                                   text_color=C_FG, height=34,
+        # ---- 状态栏: 左状态 + 右网络路径（点它打开网络设置） ----
+        bar = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=8, height=34)
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew",
+                 padx=16, pady=(0, 14))
+        bar.grid_propagate(False)
+        bar.grid_columnconfigure(0, weight=1)
+        self.status = ctk.CTkLabel(bar, text="状态: 就绪", anchor="w",
+                                   text_color=C_FG,
                                    font=ctk.CTkFont("Microsoft YaHei UI", 12))
-        self.status.grid(row=2, column=0, columnspan=2, sticky="ew",
-                         padx=16, pady=(0, 14))
+        self.status.grid(row=0, column=0, sticky="ew", padx=(12, 6))
+        self.btn_net = ctk.CTkButton(
+            bar, text="网络: —", command=self._open_network, height=24, width=250,
+            font=ctk.CTkFont("Microsoft YaHei UI", 12), fg_color="transparent",
+            hover_color=C_BTN_HOV, text_color=C_DIM, corner_radius=6)
+        self.btn_net.grid(row=0, column=1, sticky="e", padx=(6, 8))
         self._apply_layout()               # 按开关初始状态排布一次
 
     def _apply_layout(self):
@@ -279,6 +415,115 @@ class App(ctk.CTk):
         self.log_line("[dbg] state.json : %s (凭据 + 设备信息; 删除它 = 退出登录)"
                       % cl.STATE_FILE)
         self.log_line("[dbg] 提示: 启动游戏 = 静默续期/扫码 → 兑换384 → 管道 → 拉起, 一键全流程")
+        self._report_route()
+        # 配置里预置了托盘时：仍要显式确认一次才真正启用（决不默认生效）
+        if cl._cfg_bool("gui", "tray_enabled", default=False):
+            self.var_tray.set(True)
+            self.after(300, self._toggle_tray)
+
+    # ================= 结构化事件上屏 =================
+    def _on_event(self, ev):
+        """czn_lite 每记录一条事件就回调一次（可能在 worker 线程）→ 经队列上屏。
+
+        界面日志固定为最细粒度：所有事件、所有字段（含请求头与请求体）全部明文上屏。
+        不做分级 —— 别的等级只会丢掉排查所需的信息。
+        """
+        for line in cl.render_ui(ev):
+            self.log_line(line)
+
+    # ================= 网络路径指示 =================
+    def _report_route(self):
+        """把当前网络路径决策写进日志，并刷新状态栏右侧标签。"""
+        try:
+            route = cl.resolve_route("https://s-api.onstove.com/")
+        except Exception as e:
+            self.log_line("[!] 网络路径解析失败：%s" % e)
+            self.btn_net.configure(text="网络: 解析失败")
+            return
+        self.log_line("[*] 网络路径: %s → %s" % (route.source, route.detail))
+        target = route.proxies.get("all") or "直连"
+        if len(target) > 34:
+            target = target[:31] + "…"
+        self.btn_net.configure(text="网络: %s" % target)
+
+    def _open_network(self):
+        """网络设置：直连 / 系统代理 / 手动代理。写回 config.json 即时生效。"""
+        cfg = cl.network_config()
+        win = ctk.CTkToplevel(self)
+        win.title("网络设置")
+        win.geometry("520x420")
+        win.minsize(460, 380)
+        win.configure(fg_color=C_BG)
+        win.transient(self)
+        win.grab_set()
+        win.after(120, win.lift)
+        f = ctk.CTkFont("Microsoft YaHei UI", 12)
+        var = ctk.StringVar(value=cfg["mode"] if cfg["mode"] in
+                            ("direct", "system", "manual") else "direct")
+        box = {"ok": False}
+
+        ctk.CTkLabel(win, text="网络路径", text_color=C_FG,
+                     font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold")
+                     ).pack(anchor="w", padx=22, pady=(18, 2))
+        for value, text in (("direct", "直连（默认；显式锁定，忽略系统代理与环境变量）"),
+                            ("system", "跟随系统代理（WinINET / PAC / WPAD）"),
+                            ("manual", "手动指定代理")):
+            ctk.CTkRadioButton(win, text=text, variable=var, value=value,
+                               font=f, fg_color=C_ACCENT,
+                               hover_color=C_ACCENT_HV).pack(anchor="w", padx=26, pady=3)
+
+        ctk.CTkLabel(win, text="代理地址（手动模式用，如 http://127.0.0.1:7890 / "
+                              "socks5://127.0.0.1:1080）",
+                     text_color=C_DIM, font=f, wraplength=460, justify="left"
+                     ).pack(anchor="w", padx=22, pady=(12, 2))
+        e_url = ctk.CTkEntry(win, width=456, height=32, font=f)
+        e_url.insert(0, cfg["manual_url"])
+        e_url.pack(padx=22)
+
+        ctk.CTkLabel(win, text="绕过表（分号分隔，支持 * 通配；留空表示不绕过）",
+                     text_color=C_DIM, font=f).pack(anchor="w", padx=22, pady=(10, 2))
+        e_byp = ctk.CTkEntry(win, width=456, height=32, font=f)
+        e_byp.insert(0, cfg["manual_bypass"])
+        e_byp.pack(padx=22)
+
+        ctk.CTkLabel(win, text="代理账号 / 密码（可选，仅手动模式；明文存于 config.json）",
+                     text_color=C_DIM, font=f).pack(anchor="w", padx=22, pady=(10, 2))
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(padx=22, fill="x")
+        e_user = ctk.CTkEntry(row, width=222, height=32, font=f, placeholder_text="用户名")
+        e_user.insert(0, cfg["manual_username"])
+        e_user.pack(side="left")
+        e_pwd = ctk.CTkEntry(row, width=222, height=32, font=f, show="●",
+                             placeholder_text="密码")
+        e_pwd.insert(0, cfg["manual_password"])
+        e_pwd.pack(side="left", padx=(12, 0))
+
+        def ok():
+            mode = var.get()
+            if mode == "manual" and not e_url.get().strip():
+                self.log_line("[!] 手动模式需要填代理地址 —— 已按直连处理")
+            cl.save_network_config(mode=mode, manual_url=e_url.get().strip(),
+                                   manual_username=e_user.get().strip(),
+                                   manual_password=e_pwd.get(),
+                                   manual_bypass=e_byp.get().strip())
+            box["ok"] = True
+            self.log_line("[*] 网络设置已保存并即时生效")
+            self._report_route()
+            win.grab_release()
+            win.destroy()
+
+        def cancel():
+            win.grab_release()
+            win.destroy()
+
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill="x", padx=22, pady=(16, 0))
+        ctk.CTkButton(bar, text="取消", width=84, fg_color=C_BTN,
+                      hover_color=C_BTN_HOV, command=cancel).pack(side="right")
+        ctk.CTkButton(bar, text="保存", width=110, fg_color=C_ACCENT,
+                      hover_color=C_ACCENT_HV, command=ok).pack(side="right", padx=(0, 8))
+        self.wait_window(win)
+        return box["ok"]
 
     # ================= 日志通道 =================
     def log_line(self, msg: str):
@@ -308,15 +553,20 @@ class App(ctk.CTk):
                 for ln in logs:
                     tag = pick_tag(ln)
                     self.log.insert("end", ln + "\n", (tag,) if tag else ())
-                # 日志限长：超过 2000 行裁掉最旧的，防止长时间运行后
-                # Text 控件越来越大导致界面越来越卡
+                # 日志限长：超过上限裁掉最旧的，防止长时间运行后
+                # Text 控件越来越大导致界面越来越卡（上限可用 gui.ui_max_log_lines 配置）
                 total_lines = int(self.log.index("end-1c").split(".")[0])
-                if total_lines > 2000:
-                    self.log.delete("1.0", "%d.0" % (total_lines - 1500))
-                if at_bottom:
+                limit = max(200, cl._cfg_int("gui", "ui_max_log_lines", default=2000))
+                if total_lines > limit:
+                    self.log.delete("1.0", "%d.0" % int(total_lines - limit * 0.75))
+                if at_bottom and cl._cfg_bool("gui", "log_autoscroll", default=True):
                     self.log.see("end")
             if status:
                 self.status.configure(text=status)
+                # 托盘 tooltip 跟随状态，便于隐藏后判断任务是否还在跑
+                if self._tray is not None and cl._cfg_bool(
+                        "gui", "tray_tooltip_running", default=True):
+                    self._tray.set_tip("CZN Launcher Lite —— %s" % status)
             # ★ 游戏会话状态: 管道 handshake_done = 游戏真的在和管道交流
             in_game = bool(self.srv is not None and self.srv.handshake_done.is_set())
             if in_game != self._in_game:
@@ -329,6 +579,7 @@ class App(ctk.CTk):
                     if not self._busy.is_set():
                         self.set_status("状态: 就绪")
                 self._update_launch_btn()
+            self._drain_tray()        # ★ 托盘回调只入队，在这里（事件循环内）执行
             self._watch_qr()          # ★ 即时显示: 每 40ms 监视本地 qr.png
         except Exception as e:
             try:
@@ -486,11 +737,168 @@ class App(ctk.CTk):
         self.log_line("[*] 已请求停止 (已拉起的游戏进程不受影响)")
         self.set_status("状态: 已请求停止")
 
+    # ================= 托盘（默认关闭；启用需确认；隐藏需第 2 次确认） =================
+    def _confirm(self, title, text):
+        """模态确认框。★ 不绑定回车 —— 必须显式点「确定」。"""
+        win = ctk.CTkToplevel(self)
+        win.title(title)
+        win.geometry("470x300")
+        win.minsize(420, 260)
+        win.configure(fg_color=C_BG)
+        win.transient(self)
+        win.grab_set()
+        win.after(120, win.lift)
+        box = {"v": False}
+        ctk.CTkLabel(win, text=text, text_color=C_FG, justify="left", anchor="nw",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 12),
+                     wraplength=410).pack(anchor="w", padx=24, pady=(24, 0))
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill="x", padx=24, pady=(22, 0))
+
+        def _no():
+            win.grab_release()
+            win.destroy()
+
+        def _yes():
+            box["v"] = True
+            win.grab_release()
+            win.destroy()
+
+        ctk.CTkButton(bar, text="取消", width=84, fg_color=C_BTN,
+                      hover_color=C_BTN_HOV, command=_no).pack(side="right")
+        ctk.CTkButton(bar, text="确定", width=110, fg_color=C_ACCENT,
+                      hover_color=C_ACCENT_HV, command=_yes).pack(side="right",
+                                                                  padx=(0, 8))
+        self.wait_window(win)
+        return box["v"]
+
+    def _toggle_tray(self):
+        """顶栏「托盘」开关。启用=第 1 次确认；取消勾选则直接回到「关闭即退出」。"""
+        if not self.var_tray.get():
+            self._tray_off()
+            return
+        if not self._confirm(
+                "启用托盘模式",
+                "启用后：\n"
+                "· 点窗口关闭按钮不再退出，而是先询问是否隐藏到托盘\n"
+                "· 隐藏后程序继续在后台运行，游戏会话不会中断\n"
+                "· 要真正退出：右键托盘图标 → 退出\n\n"
+                "确定启用托盘模式吗？"):
+            self.var_tray.set(False)
+            return
+        self._tray_on()
+
+    def _tray_on(self):
+        try:
+            self._tray = _Tray()
+        except Exception as e:
+            self._tray = None
+            self.var_tray.set(False)
+            self.log_line("[x] 托盘启用失败：%s" % e)
+            return
+        self._tray.show(info="托盘模式已启用 —— 关闭窗口将先询问",
+                        title="CZN Launcher Lite")
+        self.log_line("[*] 托盘模式已启用：关闭窗口将先询问，再决定是否隐藏")
+        self.set_status("状态: 托盘模式已启用")
+
+    def _drain_tray(self):
+        """把托盘回调投递的意图在 Tk 事件循环里执行。
+
+        ★ 必须由 _pump（after 回调）调用：WndProc 里碰 Tk 会触发 GIL 致命错误。
+        """
+        if self._tray is None:
+            return
+        while True:
+            try:
+                action = self._tray.pending.get_nowait()
+            except queue.Empty:
+                return
+            if action == "restore":
+                self._tray_restore()
+            elif action == "menu":
+                self._tray_popup()
+            elif action == "quit":
+                self._tray_quit()
+
+    def _tray_popup(self):
+        """托盘右键菜单（Tk 菜单，与主程序同一套 UI）。
+
+        ★ 菜单必须保存在 self 上：tk_popup 是非阻塞的，局部变量在函数返回后
+        会被 GC 回收，菜单会立刻消失。
+        """
+        import tkinter as tk
+        try:
+            if self._tray_menu is None:
+                self._tray_menu = tk.Menu(self, tearoff=0)
+                self._tray_menu.add_command(label="显示窗口",
+                                            command=self._tray_restore)
+                self._tray_menu.add_separator()
+                self._tray_menu.add_command(label="退出", command=self._tray_quit)
+            self._tray_menu.tk_popup(*self.winfo_pointerxy())
+        except Exception as e:
+            self.log_line("[!] 托盘菜单打开失败：%s" % e)
+        finally:
+            try:
+                self._tray_menu.grab_release()
+            except Exception:
+                pass
+
+    def _tray_off(self):
+        if self._tray is not None:
+            self._tray.destroy()
+            self._tray = None
+            self.log_line("[*] 托盘模式已关闭：关闭窗口将直接退出")
+            self.set_status("状态: 已关闭托盘模式")
+
+    def _tray_restore(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.set_status("状态: 已从托盘恢复")
+
+    def _tray_quit(self):
+        """托盘菜单「退出」：与关闭窗口走同一条退出路径。"""
+        self._really_close()
+
     def _on_close(self):
+        """关闭按钮：托盘开启时先第 2 次确认再隐藏；未开启时行为与原来完全一致。"""
+        if self._tray is None:
+            self._really_close()
+            return
+        if cl._cfg_bool("gui", "tray_confirm_on_hide", default=True) and \
+                not self._confirm(
+                    "隐藏到托盘",
+                    "将把窗口隐藏到托盘，程序继续在后台运行。\n"
+                    "正在执行的任务与游戏会话不会中断。\n\n"
+                    "要真正退出：右键托盘图标 → 退出。\n\n"
+                    "确定隐藏到托盘吗？"):
+            return
+        self.withdraw()
+        self._tray.show(
+            info="已隐藏到托盘 —— 双击图标恢复，右键菜单可退出"
+                 if cl._cfg_bool("gui", "tray_notify_on_hide", default=True)
+                 else None,
+            title="CZN Launcher Lite")
+        self.set_status("状态: 已隐藏到托盘（右键托盘图标可退出）")
+        self.log_line("[*] 已隐藏到托盘 —— 程序仍在后台运行，游戏会话保持")
+
+    def _really_close(self):
+        """真正的退出路径：置取消 → 停管道 → 摘托盘 → 销毁窗口，进程随即结束。"""
         self._cancel.set()
+        cl.EVENT_SINK = None
+        # 若右键菜单还挂着，先撤下并释放 grab —— 否则 Tk 可能停在菜单的事件循环里
+        if self._tray_menu is not None:
+            try:
+                self._tray_menu.unpost()
+                self._tray_menu.grab_release()
+            except Exception:
+                pass
         if self.srv is not None:
             self.srv.stop()
             self.srv = None
+        if self._tray is not None:
+            self._tray.destroy()        # ★ NIM_DELETE 必须先于进程退出
+            self._tray = None
         self.destroy()
 
     # ---- 前置条件检查 (三种登录任务共用; 全部打印到日志) ----
@@ -511,10 +919,14 @@ class App(ctk.CTk):
                       % ("有" if has_rt else "无"))
         self.log_line("[dbg]   install_root  : %s" % (cl.INSTALL_ROOT or "未配置(先获取离线信息)"))
         self.log_line("[dbg]   loader        : %s" % ("存在 ✓" if loader_ok else "缺失 ✗"))
+        if cl.NET_PREFLIGHT:
+            ok, detail = cl.preflight()
+            self.log_line("[%s] 网络预检: %s" % ("+" if ok else "!", detail))
         return {"state": st_ok, "refresh": has_rt, "loader": loader_ok}
 
     # ---- 任务 1: 续期 (仅续期: 必须已有本地凭据, 与扫码登录职责分离) ----
     def _task_renew(self):
+        cl.set_stage("静默续期")
         pre = self._precondition_report()
         if not (pre["state"] and pre["refresh"]):
             self.log_line("[x] 无本地凭据 —— 续期无从谈起, 请点『扫码登录』完成首次登录")
@@ -532,6 +944,7 @@ class App(ctk.CTk):
 
     # ---- 任务 2: 扫码登录按钮 (用户主动申请二维码 → 即时显示 → 轮询自动登录) ----
     def _task_qrlogin(self):
+        cl.set_stage("扫码登录")
         self.log_line("[*] 扫码登录: 全新登录, 不依赖本地凭据 (凭据失效时也用它)")
         self.set_status("状态: 申请二维码…")
         auth = cl.StoveAuth()
@@ -644,6 +1057,7 @@ class App(ctk.CTk):
         return w.result
 
     def _task_pwdlogin(self):
+        cl.set_stage("账号密码登录")
         self.log_line("[*] 账号密码登录（provider_cd=SO）")
         creds = self._ui_sync(self._dialog_credentials)
         if not creds:
@@ -709,6 +1123,7 @@ class App(ctk.CTk):
 
     # ---- 任务 3: 启动游戏(全流程一键) ----
     def _task_launch(self):
+        cl.set_stage("启动游戏")
         if self._in_game:
             self.log_line("[!] 游戏会话进行中 —— 请先关闭游戏或点停止")
             self.set_status("状态: 游戏已在大厅/运行中")
@@ -803,6 +1218,7 @@ class App(ctk.CTk):
 
     # ---- 任务 3: 获取离线信息 (零联网采集 → 实际写入 state.json) ----
     def _task_collect(self):
+        cl.set_stage("获取离线信息")
         self.set_status("状态: 采集离线信息 (零联网)…")
         info = cl.collect_local_info()
         # 读-改-写 state.json: 保留已有凭据(launcher_refresh 等), 合并采集值
@@ -879,13 +1295,18 @@ class App(ctk.CTk):
                       "install_root 已置空, 用『获取离线信息』重新探测安装路径")
         self.set_status("状态: 已恢复初始状态")
 
-    # ---- 日志导出 ----
+    # ---- 日志导出（导出的是「反馈日志」：结构化、全链路、已脱敏） ----
     def _export_log(self):
-        body = self.log.get("1.0", "end")
-        out = self._base_dir() / time.strftime("czn-lite-log-%Y%m%d-%H%M%S.txt")
-        out.write_text(body, encoding="utf-8")
-        self.log_line("[+] 日志已导出: %s" % out)
-        self.set_status("状态: 日志已导出")
+        """界面日志保持明文（绝对坦诚）；导出的是脱敏后的反馈日志。"""
+        try:
+            out = cl.export_report(self._base_dir())
+        except Exception as e:
+            self.log_line("[x] 导出反馈日志失败：%s" % e)
+            self.set_status("状态: 导出失败")
+            return
+        self.log_line("[+] 反馈日志已导出（已脱敏，可直接发送）: %s" % out)
+        self.log_line("[dbg] 界面日志为明文（含凭据），外发请用上面这个文件")
+        self.set_status("状态: 已导出反馈日志")
 
     # ---- 右上角: GitHub / 使用说明 (内容均来自 config.json gui 段, 待定可配) ----
     def _open_github(self):
