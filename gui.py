@@ -225,6 +225,7 @@ class App(ctk.CTk):
         self._in_game = False           # 游戏管道会话进行中(handshake_done)
         self._tray = None               # 托盘（默认不启用）
         self._tray_menu = None          # 托盘右键菜单（需长期持有，见 _tray_popup）
+        self._dl_last = 0.0             # 下载进度节流时间戳
         self.var_log = ctk.BooleanVar(value=True)   # 日志窗显示开关
         self.var_qr = ctk.BooleanVar(value=True)    # 二维码面板显示开关
         self.var_tray = ctk.BooleanVar(value=False)  # 托盘模式开关（默认关）
@@ -314,7 +315,7 @@ class App(ctk.CTk):
         qr.grid_propagate(False)
         qr.grid_columnconfigure(0, weight=1)
         qr.grid_columnconfigure(1, weight=1)
-        qr.grid_rowconfigure(5, weight=1)        # QR 图像区吃掉余量
+        qr.grid_rowconfigure(6, weight=1)        # QR 图像区吃掉余量
         self.qr_panel = qr
 
         self.btn = {}
@@ -343,7 +344,7 @@ class App(ctk.CTk):
         _small("qrcode",  "扫码登录",  lambda: self._run_task(self._task_qrlogin), 3, 1)
         qr.grid_columnconfigure(1, weight=1)
 
-        # ★ 账号密码登录（整行；二维码区因此下移到 5/6 行）
+        # ★ 账号密码登录（整行；二维码区因此下移到 6/7 行）
         _b = ctk.CTkButton(qr, text="账号密码登录",
                            command=lambda: self._run_task(self._task_pwdlogin),
                            height=36, font=ui_font, fg_color=C_BTN,
@@ -351,20 +352,24 @@ class App(ctk.CTk):
         _b.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14, pady=2)
         self.btn["pwd"] = _b
 
+        # ★ 游戏本体更新（整行两键）：检查更新 / 校验完整性
+        _small("update", "检查更新",   lambda: self._run_task(self._task_check_update), 5, 0)
+        _small("verify", "校验完整性", lambda: self._run_task(self._task_verify_files), 5, 1)
+
         # 图像标签: 无文件=完全空白; 尺寸动态适配不写死
         # (旧"扫码登录"文字标题已删 —— 与同名按钮重复, 纯困惑)
         # ★ columnspan=2: 必须跨满两列, 否则二维码被挤进半列宽(实测 217px 缩水)
         self.qr_label = ctk.CTkLabel(qr, text="", fg_color="transparent")
         # 二维码遮罩: 只盖图片区, 不影响上方按钮
         self.qr_cover = ctk.CTkFrame(qr, fg_color="#000000", corner_radius=0)
-        self.qr_label.grid(row=5, column=0, columnspan=2, padx=12,
+        self.qr_label.grid(row=6, column=0, columnspan=2, padx=12,
                            pady=(4, 2), sticky="nsew")
         self.qr_label.bind("<Button-1>", self._on_qr_click)   # 点击→打开本地 png
         self.qr_label.bind("<Configure>", self._on_qr_panel_resize)  # 尺寸自校正
         ctk.CTkLabel(qr, text="点击二维码打开本地png",   # 短文案, 防两侧截断
                      font=ctk.CTkFont("Microsoft YaHei UI", 11),
                      text_color=C_DIM, wraplength=272,
-                     justify="center").grid(row=6, column=0, columnspan=2,
+                     justify="center").grid(row=7, column=0, columnspan=2,
                                             pady=(4, 12))
         qr.bind("<Configure>", self._on_qr_panel_resize)
 
@@ -1121,6 +1126,119 @@ class App(ctk.CTk):
         self.log_line("[dbg] 凭据已写回 state.json")
         self.set_status("状态: 已登录 (账密)")
 
+    # ================= 游戏本体更新（DPMS） =================
+    # 只处理 <install_root>\bin 下的受管文件；资源热更(bin\appdata\cznlive)由游戏自己完成。
+    def _upd(self):
+        """懒加载 update 模块（放在同目录，缺失时不影响其余功能）。"""
+        try:
+            import update as upd
+            return upd
+        except Exception as e:
+            self.log_line("[x] 更新模块不可用: %s" % e)
+            return None
+
+    def _on_dl_progress(self, delta, done, expect):
+        """下载进度节流上屏（默认每 0.4 秒一次）。"""
+        now = time.time()
+        if now - self._dl_last < 0.4 and done != expect:
+            return
+        self._dl_last = now
+        if expect:
+            self.set_status("状态: 下载中 %d/%d KB（%.0f%%）"
+                            % (done // 1024, expect // 1024,
+                               done * 100.0 / max(1, expect)))
+        else:
+            self.set_status("状态: 下载中 %d KB" % (done // 1024))
+
+    def _ask_update(self, live, local):
+        """确认框必须回 UI 线程弹（worker 线程碰 Tk 会出问题）。"""
+        return self._ui_sync(lambda: self._confirm(
+            "游戏本体更新",
+            "检测到游戏本体新版本 %d（本地 %d）。\n\n"
+            "将下载官方补丁并替换游戏目录下 bin 内的受管文件。\n"
+            "请先关闭正在运行的游戏。\n\n是否现在更新？" % (live, local)))
+
+    def _do_update(self, upd=None, force=False):
+        """执行更新。force=True 用于「校验后修复」—— 版本已最新也要按清单比对一次。"""
+        upd = upd or self._upd()
+        if upd is None:
+            return False
+        self.set_status("状态: 游戏本体更新中…")
+        self._dl_last = 0.0
+        r = upd.update(on_event=self.log_line, cancel=self._cancel.is_set,
+                       on_progress=self._on_dl_progress, force=force)
+        self.log_line("[%s] %s" % ("+" if r.ok else "x", r.message))
+        if r.plan is not None and r.plan.modified:
+            self.log_line("[!] 注意：以下 %d 个文件此前不是官方原版，已被覆盖："
+                          % len(r.plan.modified))
+            for e in r.plan.modified:
+                self.log_line("      %s" % e.rel)
+        for e, why in r.failed:
+            self.log_line("      - %s：%s" % (e.rel, why))
+        self.set_status("状态: 更新完成" if r.ok else "状态: 更新失败")
+        return r.ok
+
+    def _maybe_update(self):
+        """启动流程里的更新检查。返回 True 表示可以继续启动。"""
+        upd = self._upd()
+        if upd is None:
+            return True
+        if not cl.INSTALL_ROOT or not os.path.isdir(cl.INSTALL_ROOT):
+            self.log_line("[!] 未配置游戏目录，跳过更新检查")
+            return True
+        self.set_status("状态: 检查游戏本体版本…")
+        info = upd.check(on_event=self.log_line)
+        if info.get("error"):
+            self.log_line("[!] %s" % info["error"])
+            return True
+        if not info["need_update"]:
+            self.log_line("[+] 游戏本体已是最新（%d）" % info["local"])
+            return True
+        self.log_line("[!] 游戏本体有新版本 %d（本地 %d）"
+                      % (info["live"], info["local"]))
+        if not cl._cfg_bool("update", "auto_download", default=False):
+            if not self._ask_update(info["live"], info["local"]):
+                self.log_line("[*] 已跳过更新（可稍后点「检查更新」）")
+                return True
+        self._do_update(upd)
+        return True
+
+    def _task_check_update(self):
+        cl.set_stage("检查更新")
+        upd = self._upd()
+        if upd is None:
+            return
+        self.set_status("状态: 检查游戏本体版本…")
+        info = upd.check(on_event=self.log_line)
+        if info.get("error"):
+            self.log_line("[x] %s" % info["error"])
+            self.set_status("状态: 检查失败")
+            return
+        if not info["need_update"]:
+            self.log_line("[+] 游戏本体已是最新（本地 %d）" % info["local"])
+            self.set_status("状态: 已是最新")
+            return
+        self.log_line("[!] 发现新版本 %d（本地 %d）" % (info["live"], info["local"]))
+        if self._ask_update(info["live"], info["local"]):
+            self._do_update(upd)
+        else:
+            self.set_status("状态: 已跳过更新")
+
+    def _task_verify_files(self):
+        cl.set_stage("完整性校验")
+        upd = self._upd()
+        if upd is None:
+            return
+        self.set_status("状态: 校验游戏本体完整性…")
+        r = upd.verify(on_event=self.log_line, cancel=self._cancel.is_set)
+        self.log_line("[%s] %s" % ("+" if r.ok else "!", r.message))
+        if not r.ok and self._ui_sync(lambda: self._confirm(
+                "完整性校验未通过",
+                "%s\n\n是否按官方清单重新下载并修复这些文件？" % r.message)):
+            self._do_update(upd, force=True)     # 版本可能已是最新，必须 force 才会比对修复
+            return
+        self.set_status("状态: 校验完成" if r.ok else "状态: 校验发现异常")
+
     # ---- 任务 3: 启动游戏(全流程一键) ----
     def _task_launch(self):
         cl.set_stage("启动游戏")
@@ -1179,6 +1297,12 @@ class App(ctk.CTk):
         auth.resolve_guid()
         auth.import_member_fields_from_official_log()
         auth.save()
+
+        # 游戏本体更新：在拉起之前做完自己能做的（可关：config.json 的 update.check_on_launch）
+        if cl._cfg_bool("update", "check_on_launch", default=True):
+            self._maybe_update()
+            if self._cancel.is_set():
+                return
 
         required = cl.build_required_info(auth)
         cl.validate_required_info(required)

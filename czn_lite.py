@@ -2469,6 +2469,36 @@ def dry_run():
     print("=== DRY RUN PASS ===")
 
 
+def _game_update(args):
+    """游戏本体更新（DPMS）：在拉起游戏之前完成。
+
+    只处理 <install_root>\\bin 下的受管文件（清单里的 F 条目）。
+    资源热更（bin\\appdata\\cznlive）由游戏引擎自己完成，这里绝不触碰。
+    """
+    try:
+        import update as upd
+    except Exception as e:
+        print("[!] 更新模块不可用（%s），跳过更新" % e)
+        return
+
+    if args.verify_files:
+        r = upd.verify(on_event=print)
+        print("[%s] %s" % ("+" if r.ok else "!", r.message))
+        return
+
+    if not args.update and not _cfg_bool("update", "auto_download", default=False):
+        info = upd.check(on_event=print)
+        if info.get("error"):
+            print("[!] %s" % info["error"])
+        elif info.get("need_update"):
+            print("[!] 游戏本体有新版本 %d（本地 %d）—— 加 --update 执行，"
+                  "或在界面点「检查更新」" % (info["live"], info["local"]))
+        return
+
+    r = upd.update(on_event=print)
+    print("[%s] %s" % ("+" if r.ok else "x", r.message))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="czn-lite 控制台版（与 GUI 共用同一套核心逻辑）")
@@ -2484,6 +2514,10 @@ def main():
                         help="显式指定 REQUIRED_INFO 的 guid（默认自动导入）")
     parser.add_argument("--capture-stdout", action="store_true",
                         help="诊断：重定向游戏进程 stdout 到文件")
+    parser.add_argument("--update", action="store_true",
+                        help="启动前检查并执行游戏本体更新（DPMS）")
+    parser.add_argument("--verify-files", action="store_true",
+                        help="只做游戏本体完整性校验，不下载任何东西")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -2543,6 +2577,11 @@ def main():
     auth.resolve_guid(explicit=args.guid)
     auth.import_member_fields_from_official_log()
     auth.save()
+
+    # 游戏本体更新：在拉起之前做完自己能做的（可关：config.json 的 update.check_on_launch）
+    if not args.offline and (args.update or args.verify_files
+                             or _cfg_bool("update", "check_on_launch", default=True)):
+        _game_update(args)
 
     required = build_required_info(auth)
     validate_required_info(required)

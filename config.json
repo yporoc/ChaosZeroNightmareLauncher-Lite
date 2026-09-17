@@ -54,5 +54,17 @@
   "file_max_mb": 8,
   "include_env_snapshot": true,
   "timestamp_ms": true
+ },
+ "update": {
+  "check_on_launch": true,
+  "auto_download": false,
+  "verify_mode": "full",
+  "workers": 4,
+  "resume": true,
+  "backup_before_replace": true,
+  "preserve_modified": false,
+  "keep_temp": false,
+  "probe_fallback": true,
+  "check_vcredist": true
  }
 }
