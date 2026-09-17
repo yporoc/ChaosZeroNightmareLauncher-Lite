@@ -1,6 +1,6 @@
 # CZN Launcher Lite
 
-Chaos Zero Nightmare（卡厄思梦境）国际服第三方极简启动器，支持全程免代理免加速直接裸连登录和启动游戏。
+Chaos Zero Nightmare（卡厄思梦境）国际服第三方极简启动器.
 
 > **免责声明**：本项目为非官方第三方工具，与 Smilegate / STOVE 无任何关联。
 > 仅供个人学习研究，禁止商业用途。使用本项目可能违反游戏服务条款并带来账号风险，
