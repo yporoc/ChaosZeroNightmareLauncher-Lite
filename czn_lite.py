@@ -659,10 +659,15 @@ _KEEP_TAIL = {"member-no", "guid", "game-member-no", "game-guid"}
 _FULL_MASK = {"nickname", "member-nickname", "birth-dt", "reg-dt", "machine-guid"}
 _PREFIX8 = {"session", "qr-login-session", "device-key", "transaction-id",
             "session-tid", "ref-session-id"}
+# 代理串可能内嵌账号密码（_normalize_proxy 注入，或环境变量自带），
+# 而它的字段名不在上表里 —— 必须按 URL 用户信息统一抹掉。
+_URL_USERINFO = re.compile(r"://[^/@\s:]+:[^/@\s]*@")
 
 
 def mask_value(key, value):
     """按字段名脱敏。字段名不认识时原样返回（长度等非敏感信息保留）。"""
+    if isinstance(value, str):
+        value = _URL_USERINFO.sub("://***:***@", value)
     name = str(key or "").strip().lower().replace("_", "-")
     text = "" if value is None else str(value)
 
@@ -828,7 +833,8 @@ def export_report(out_dir=None, revealed=None):
     lines.append("")
     if LOG_ENV_SNAPSHOT:
         lines.append("---- 环境快照 ----")
-        for key, val in env_snapshot().items():
+        # 快照里含系统/环境变量代理串，必须与事件流走同一套脱敏
+        for key, val in mask_obj(env_snapshot()).items():
             lines.append("%-14s %s" % (key, val))
         lines.append("")
     lines.append("---- 事件流 ----")
