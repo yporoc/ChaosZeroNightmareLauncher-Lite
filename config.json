@@ -17,6 +17,42 @@
  },
  "gui": {
   "github_url": "https://github.com/yporoc/ChaosZeroNightmareLauncher-Lite",
-  "help_text": "0.state.json 内含登录凭据，等同账号密码，切勿上传\n 1.本作品仅供个人学习、欣赏使用，禁止任何形式的商用、二次售卖、转载盈利。使用者使用本作品产生的一切法律纠纷、经济损失及相关责任，均由使用者自行承担，作品作者不承担任何连带责任。\n\n2.保持config.json与启动器exe在同一目录下，首次启动需获取离线信息，离线信息保存在config.json中，再点扫码登录用手机stove app扫码获取登录凭据，之后即可启动游戏"
+  "help_text": "0.state.json 内含登录凭据，等同账号密码，切勿上传\n 1.本作品仅供个人学习、欣赏使用，禁止任何形式的商用、二次售卖、转载盈利。使用者使用本作品产生的一切法律纠纷、经济损失及相关责任，均由使用者自行承担，作品作者不承担任何连带责任。\n\n2.保持config.json与启动器exe在同一目录下，首次启动需获取离线信息，离线信息保存在config.json中，再点扫码登录用手机stove app扫码获取登录凭据，之后即可启动游戏",
+  "tray_enabled": false,
+  "tray_confirm_on_hide": true,
+  "tray_notify_on_hide": true,
+  "tray_tooltip_running": true,
+  "log_autoscroll": true,
+  "ui_max_log_lines": 2000
+ },
+ "app": {
+  "version": "0.0.3beta-dev2"
+ },
+ "network": {
+  "mode": "direct",
+  "system_read_wininet": true,
+  "system_read_winhttp": true,
+  "system_use_pac": true,
+  "system_bypass_extra": "",
+  "manual_url": "",
+  "manual_username": "",
+  "manual_password": "",
+  "manual_bypass": "",
+  "host_overrides": {},
+  "connect_timeout": 10,
+  "read_timeout": 20,
+  "retry": 0,
+  "verify_tls": true,
+  "preflight": false,
+  "log_decisions": true
+ },
+ "log": {
+  "export_reveal_secrets": false,
+  "mask_keep_tail": 4,
+  "ring_size": 5000,
+  "file_enabled": false,
+  "file_max_mb": 8,
+  "include_env_snapshot": true,
+  "timestamp_ms": true
  }
 }
