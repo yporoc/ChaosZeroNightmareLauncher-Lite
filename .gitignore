@@ -8,6 +8,8 @@ last_required_info.json
 last_env.json
 game_stdout.log
 czn-lite-log-*.txt
+czn-lite-report-*.txt
+czn-lite-session-*.log
 
 # Python
 __pycache__/

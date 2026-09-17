@@ -30,7 +30,9 @@ refresh_token 保存在本机 state.json 中，请妥善保管、切勿外传。
 """
 import argparse
 import base64
+import collections
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -42,6 +44,8 @@ import time
 import types
 import uuid
 import winreg
+from ctypes import wintypes
+from dataclasses import dataclass
 from pathlib import Path
 
 from curl_cffi import CurlHttpVersion, requests
@@ -228,6 +232,625 @@ CALLER_ID = _cfg("platform", "caller_id", default="STOVE_LAUNCHER_VER.3.2.28.733
 LOADER_REL = _cfg("game", "loader_exe",
                   default=r"bin\ucldr_chaoszeronightmare_gl_loader_x64.exe")
 LOADER_ARGS = _cfg("game", "loader_args", default=r"bin\ssr-stove-shield.exe")
+
+
+# ====================================================================
+# 网络与日志配置（全部有默认值 —— 不写这两段也能跑）
+# ====================================================================
+def _cfg_bool(*path, default=False):
+    value = _cfg(*path, default=default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return default if value is None else bool(value)
+
+
+def _cfg_int(*path, default=0):
+    try:
+        return int(_cfg(*path, default=default))
+    except (TypeError, ValueError):
+        return default
+
+
+NET_MODE = str(_cfg("network", "mode", default="direct") or "direct").strip().lower()
+NET_READ_WININET = _cfg_bool("network", "system_read_wininet", default=True)
+NET_READ_WINHTTP = _cfg_bool("network", "system_read_winhttp", default=True)
+NET_USE_PAC = _cfg_bool("network", "system_use_pac", default=True)
+NET_SYS_BYPASS_EXTRA = str(_cfg("network", "system_bypass_extra", default="") or "")
+NET_MANUAL_URL = str(_cfg("network", "manual_url", default="") or "")
+NET_MANUAL_USER = str(_cfg("network", "manual_username", default="") or "")
+NET_MANUAL_PASS = str(_cfg("network", "manual_password", default="") or "")
+NET_MANUAL_BYPASS = str(_cfg("network", "manual_bypass", default="") or "")
+NET_HOST_OVERRIDES = _cfg("network", "host_overrides", default=None)
+NET_READ_TIMEOUT = _cfg_int("network", "read_timeout", default=20)
+NET_CONNECT_TIMEOUT = _cfg_int("network", "connect_timeout", default=10)
+NET_RETRY = _cfg_int("network", "retry", default=0)
+NET_VERIFY_TLS = _cfg_bool("network", "verify_tls", default=True)
+NET_PREFLIGHT = _cfg_bool("network", "preflight", default=False)
+NET_LOG_DECISIONS = _cfg_bool("network", "log_decisions", default=True)
+
+LOG_EXPORT_REVEAL = _cfg_bool("log", "export_reveal_secrets", default=False)
+LOG_MASK_TAIL = _cfg_int("log", "mask_keep_tail", default=4)
+LOG_RING_SIZE = max(100, _cfg_int("log", "ring_size", default=5000))
+LOG_FILE_ENABLED = _cfg_bool("log", "file_enabled", default=False)
+LOG_FILE_MAX_MB = _cfg_int("log", "file_max_mb", default=8)
+LOG_ENV_SNAPSHOT = _cfg_bool("log", "include_env_snapshot", default=True)
+LOG_TS_MS = _cfg_bool("log", "timestamp_ms", default=True)
+
+# 版本号仅用于日志文件名与报告抬头，未配置则不写（不臆造版本）
+APP_VERSION = str(_cfg("app", "version", default="") or "")
+
+# ====================================================================
+# 网络路径解析
+# --------------------------------------------------------------------
+# 三条实测结论决定了这里的写法：
+#  ① curl_cffi 未显式传 proxies 时不会 setopt(CURLOPT_PROXY)，libcurl 遂回落到
+#     读 http_proxy/https_proxy/all_proxy 环境变量 —— 会「静默走代理」，
+#     使 README 承诺的「免代理裸连」失效。
+#  ② 因此直连必须显式传 {"all": ""}：只有空串才会真正关掉代理；
+#     proxies={"all": None} 与 proxy="" 都会被 curl_cffi 的判断吃掉，无效。
+#  ③ PAC 是 per-URL 的，所以路由按 host 解析并缓存，不能只算一次。
+# ====================================================================
+@dataclass(frozen=True)
+class Route:
+    """一次请求的网络路径决策结果。"""
+    proxies: dict          # 直接喂给 curl_cffi；直连 = {"all": ""}
+    source: str            # 默认直连 / 手动 / 按域名覆盖 / 系统(WinINET|PAC|WPAD)
+    detail: str            # 人可读依据，进日志
+    host: str = ""
+
+
+_DIRECT = {"all": ""}
+_NET_CACHE = {}
+_NET_LOCK = threading.Lock()
+_STAGE = {"name": "启动"}
+
+
+def set_stage(name):
+    """标注当前流程阶段，供请求日志归类。"""
+    _STAGE["name"] = str(name)
+
+
+def stage():
+    return _STAGE["name"]
+
+
+def _host_of(url):
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://([^/:?#]+)", str(url or ""))
+    return m.group(1).lower() if m else ""
+
+
+def _scheme_of(url):
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://", str(url or ""))
+    return m.group(1).lower() if m else "http"
+
+
+def _bypass_match(host, bypass):
+    """绕过表匹配：';' 分隔，'*' 通配，'<local>' = 不含点的主机名。"""
+    if not host or not bypass:
+        return False
+    for item in str(bypass).split(";"):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item == "<local>":
+            if "." not in host:
+                return True
+            continue
+        if item.startswith("*"):
+            if host.endswith(item[1:]):
+                return True
+        elif item.endswith("*"):
+            if host.startswith(item[:-1]):
+                return True
+        elif host == item or host.endswith("." + item):
+            return True
+    return False
+
+
+def _normalize_proxy(text):
+    """补全代理串：缺 scheme 补 http://；配了账号密码则注入。"""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    if NET_MANUAL_USER:
+        scheme, sep, rest = text.partition("://")
+        if sep and "@" not in rest:
+            from urllib.parse import quote
+            auth = "%s:%s" % (quote(NET_MANUAL_USER, safe=""),
+                              quote(NET_MANUAL_PASS or "", safe=""))
+            text = "%s://%s@%s" % (scheme, auth, rest)
+    return text
+
+
+def _split_proxy(proxy, url):
+    """系统代理串可能是 'host:port'，也可能是 'http=h:p;https=h:p;ftp=...'。"""
+    proxy = str(proxy or "").strip()
+    if "=" not in proxy:
+        return proxy
+    table = {}
+    for item in proxy.split(";"):
+        key, _, val = item.partition("=")
+        table[key.strip().lower()] = val.strip()
+    return table.get(_scheme_of(url)) or table.get("http") or ""
+
+
+# ---- WinHTTP API（读系统代理；PAC/WPAD 求值 libcurl 自己做不到） ----
+_WINHTTP = None
+
+_WINHTTP_AUTOPROXY_AUTO_DETECT = 0x00000001
+_WINHTTP_AUTOPROXY_CONFIG_URL = 0x00000002
+_WINHTTP_AUTO_DETECT_DHCP = 0x00000001
+_WINHTTP_AUTO_DETECT_DNS_A = 0x00000002
+_WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
+
+
+class _IE_PROXY_CONFIG(ctypes.Structure):
+    _fields_ = [("fAutoDetect", wintypes.BOOL),
+                ("lpszAutoConfigUrl", wintypes.LPWSTR),
+                ("lpszProxy", wintypes.LPWSTR),
+                ("lpszProxyBypass", wintypes.LPWSTR)]
+
+
+class _AUTOPROXY_OPTIONS(ctypes.Structure):
+    _fields_ = [("dwFlags", wintypes.DWORD),
+                ("dwAutoDetectFlags", wintypes.DWORD),
+                ("lpszAutoConfigUrl", wintypes.LPCWSTR),
+                ("lpvReserved", ctypes.c_void_p),
+                ("dwReserved", wintypes.DWORD),
+                ("fAutoLogonIfChallenged", wintypes.BOOL)]
+
+
+class _PROXY_INFO(ctypes.Structure):
+    _fields_ = [("dwAccessType", wintypes.DWORD),
+                ("lpszProxy", wintypes.LPWSTR),
+                ("lpszProxyBypass", wintypes.LPWSTR)]
+
+
+def _winhttp():
+    """惰性加载 winhttp.dll。★ WinHttpOpen 返回 HANDLE，必须显式声明 restype，
+    否则 ctypes 默认 c_int 会截断指针，后续调用全部报 err=6（无效句柄）。"""
+    global _WINHTTP
+    if _WINHTTP is None:
+        try:
+            lib = ctypes.WinDLL("winhttp", use_last_error=True)
+            lib.WinHttpOpen.restype = wintypes.HANDLE
+            lib.WinHttpOpen.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                        wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                        wintypes.DWORD]
+            lib.WinHttpCloseHandle.argtypes = [wintypes.HANDLE]
+            lib.WinHttpGetIEProxyConfigForCurrentUser.restype = wintypes.BOOL
+            lib.WinHttpGetProxyForUrl.restype = wintypes.BOOL
+            lib.WinHttpGetProxyForUrl.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR,
+                                                  ctypes.c_void_p, ctypes.c_void_p]
+            _WINHTTP = lib
+        except Exception:
+            _WINHTTP = False
+    return _WINHTTP or None
+
+
+def _system_proxy_static():
+    """读系统代理配置。返回 (proxy, bypass, pac_url, autodetect) 或 None。"""
+    lib = _winhttp()
+    if not lib:
+        return None
+    try:
+        cfg = _IE_PROXY_CONFIG()
+        if not lib.WinHttpGetIEProxyConfigForCurrentUser(ctypes.byref(cfg)):
+            return None
+        return (cfg.lpszProxy or "", cfg.lpszProxyBypass or "",
+                cfg.lpszAutoConfigUrl or "", bool(cfg.fAutoDetect))
+    except Exception:
+        return None
+
+
+def _system_proxy_for_url(url, pac_url=None, autodetect=False):
+    """按 URL 求值系统代理（PAC / WPAD）。返回 (是否成功, 代理串或 None, 说明)。"""
+    lib = _winhttp()
+    if not lib:
+        return False, None, "winhttp 不可用"
+    handle = lib.WinHttpOpen("czn-lite", 0, None, None, 0)
+    if not handle:
+        return False, None, "WinHttpOpen 失败"
+    try:
+        opts = _AUTOPROXY_OPTIONS()
+        opts.fAutoLogonIfChallenged = True
+        if pac_url:
+            opts.dwFlags |= _WINHTTP_AUTOPROXY_CONFIG_URL
+            opts.lpszAutoConfigUrl = pac_url
+        if autodetect:
+            opts.dwFlags |= _WINHTTP_AUTOPROXY_AUTO_DETECT
+            opts.dwAutoDetectFlags = _WINHTTP_AUTO_DETECT_DHCP | _WINHTTP_AUTO_DETECT_DNS_A
+        if not opts.dwFlags:
+            return False, None, "无可用的自动代理配置"
+        info = _PROXY_INFO()
+        if not lib.WinHttpGetProxyForUrl(handle, url, ctypes.byref(opts),
+                                         ctypes.byref(info)):
+            return False, None, "WinHttpGetProxyForUrl 失败(err=%d)" \
+                % ctypes.get_last_error()
+        if info.dwAccessType == _WINHTTP_ACCESS_TYPE_NAMED_PROXY:
+            return True, (info.lpszProxy or None), "按 URL 求值成功"
+        return True, None, "PAC/WPAD 判定直连"
+    except Exception as e:
+        return False, None, "求值异常 %s" % e
+    finally:
+        try:
+            lib.WinHttpCloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _system_route(url, host):
+    """把系统代理配置转成 Route（静态 → PAC → WPAD → 直连）。"""
+    if not (NET_READ_WININET or NET_READ_WINHTTP):
+        return Route(_DIRECT, "系统代理", "配置里关掉了系统代理读取 → 直连", host)
+    cfg = _system_proxy_static()
+    if cfg is None:
+        return Route(_DIRECT, "系统代理", "读不到系统代理配置 → 直连", host)
+    proxy, bypass, pac_url, autodetect = cfg
+    bypass_all = ";".join(x for x in (bypass, NET_SYS_BYPASS_EXTRA) if x)
+
+    if pac_url and NET_USE_PAC:
+        ok, found, note = _system_proxy_for_url(url, pac_url=pac_url)
+        if not ok:
+            return Route(_DIRECT, "系统(PAC)",
+                         "PAC 求值失败（%s）→ 直连" % note, host)
+        if not found:
+            return Route(_DIRECT, "系统(PAC)", "PAC 判定直连", host)
+        return Route({"all": _normalize_proxy(found)}, "系统(PAC)", found, host)
+
+    if autodetect and NET_USE_PAC:
+        ok, found, note = _system_proxy_for_url(url, autodetect=True)
+        if ok and found:
+            return Route({"all": _normalize_proxy(found)}, "系统(WPAD)", found, host)
+        if ok:
+            return Route(_DIRECT, "系统(WPAD)", "WPAD 判定直连", host)
+
+    if not proxy:
+        return Route(_DIRECT, "系统代理", "系统未启用代理 → 直连", host)
+    if _bypass_match(host, bypass_all):
+        return Route(_DIRECT, "系统代理", "命中系统绕过表 → 直连", host)
+    found = _split_proxy(proxy, url)
+    return Route({"all": _normalize_proxy(found)}, "系统(WinINET)", found, host)
+
+
+def resolve_route(url):
+    """解析一次请求的网络路径：手动 > 按域名覆盖 > 系统代理 > 默认直连。
+
+    结果按 (模式, host, 覆盖项) 缓存 —— 因为 PAC 是 per-URL 的。
+    """
+    host = _host_of(url)
+    override = None
+    if isinstance(NET_HOST_OVERRIDES, dict):
+        override = NET_HOST_OVERRIDES.get(host)
+        if override is None:
+            for key, val in NET_HOST_OVERRIDES.items():
+                key = str(key)
+                if key.startswith("*") and host.endswith(key[1:]):
+                    override = val
+                    break
+
+    cache_key = (NET_MODE, host, str(override))
+    with _NET_LOCK:
+        hit = _NET_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    if override is not None:
+        text = str(override).strip()
+        if text.lower() in ("direct", "none", "off", ""):
+            route = Route(_DIRECT, "按域名覆盖", "%s → 直连" % host, host)
+        else:
+            route = Route({"all": _normalize_proxy(text)}, "按域名覆盖",
+                          "%s → %s" % (host, _normalize_proxy(text)), host)
+    elif NET_MODE == "manual":
+        manual = _normalize_proxy(NET_MANUAL_URL)
+        if not manual:
+            route = Route(_DIRECT, "手动代理",
+                          "network.manual_url 为空 → 直连", host)
+        elif _bypass_match(host, NET_MANUAL_BYPASS):
+            route = Route(_DIRECT, "手动代理", "命中 manual_bypass → 直连", host)
+        else:
+            route = Route({"all": manual}, "手动代理", manual, host)
+    elif NET_MODE == "system":
+        route = _system_route(url, host)
+    else:
+        route = Route(_DIRECT, "默认直连", "network.mode=%s" % NET_MODE, host)
+
+    with _NET_LOCK:
+        _NET_CACHE[cache_key] = route
+    if NET_LOG_DECISIONS:
+        record("route", stage=stage(), host=host, source=route.source,
+               proxy=(route.proxies.get("all") or "直连"), detail=route.detail)
+    return route
+
+
+def reset_route_cache():
+    """配置变化后清缓存（GUI 改设置时调用）。"""
+    with _NET_LOCK:
+        _NET_CACHE.clear()
+
+
+def preflight(timeout=8):
+    """代理连通性预检：按当前路由访问一次 API 根，返回 (是否通, 说明)。
+
+    仅在 network.preflight 打开时被调用；失败不致命，只写日志。
+    """
+    url = API + "/"
+    route = resolve_route(url)
+    target = route.proxies.get("all") or "直连"
+    started = time.time()
+    try:
+        session = requests.Session(impersonate="chrome", default_headers=False,
+                                   http_version=CurlHttpVersion.V1_1)
+        session.headers.clear()
+        session.get(url, timeout=(min(5, timeout), timeout),
+                    proxies=route.proxies)
+        return True, "预检通过（%s，%dms）" % (target,
+                                              int((time.time() - started) * 1000))
+    except Exception as e:
+        return False, "预检失败（%s）：%s" % (target, str(e)[:160])
+
+
+def network_summary():
+    """当前网络路径摘要，供界面状态条显示。"""
+    probe = "%s://%s/" % ("https", "s-api.onstove.com")
+    try:
+        route = resolve_route(probe)
+    except Exception as e:
+        return "网络：解析失败（%s）" % e
+    target = route.proxies.get("all") or "直连"
+    return "网络：%s（%s）" % (target, route.source)
+
+
+# ====================================================================
+# 结构化事件 · 双渲染（界面绝对坦诚 / 导出字段级脱敏）
+# --------------------------------------------------------------------
+# 界面与导出走同一份事件数据，脱敏只发生在「导出渲染器」里 ——
+# 这样「不泄漏」是结构性保证，而不是靠事后正则清洗。
+# ====================================================================
+_EVENTS = collections.deque(maxlen=LOG_RING_SIZE)
+_EV_SEQ = [0]
+_EV_LOCK = threading.Lock()
+# GUI 把事件实时上屏用；CLI 下为 None
+EVENT_SINK = None
+
+
+def record(kind, **fields):
+    """记录一条结构化事件。返回事件本身（便于测试断言）。
+
+    若设置了 EVENT_SINK（GUI 会设），顺带实时回调一次 —— 界面与反馈日志
+    共用同一份数据，回调里只做渲染，不做脱敏。
+    """
+    with _EV_LOCK:
+        _EV_SEQ[0] += 1
+        ev = {"seq": _EV_SEQ[0], "t": time.time(), "kind": kind, "f": fields}
+        _EVENTS.append(ev)
+    sink = EVENT_SINK
+    if sink is not None:
+        try:
+            sink(ev)
+        except Exception:
+            pass
+    _write_log_file(ev)
+    return ev
+
+
+def events():
+    """取事件快照（副本，避免并发改动）。"""
+    with _EV_LOCK:
+        return list(_EVENTS)
+
+
+def clear_events():
+    with _EV_LOCK:
+        _EVENTS.clear()
+        _EV_SEQ[0] = 0
+
+
+# ---- 脱敏（只作用于导出渲染） ----
+_LEN_ONLY = {"access-token", "refresh-token", "launcher-refresh", "launcher-access",
+             "game-access-token", "game-refresh-token", "password", "captcha-token",
+             "captcha-key", "captcha-value", "authorization", "bearer", "token"}
+_KEEP_TAIL = {"member-no", "guid", "game-member-no", "game-guid"}
+_FULL_MASK = {"nickname", "member-nickname", "birth-dt", "reg-dt", "machine-guid"}
+_PREFIX8 = {"session", "qr-login-session", "device-key", "transaction-id",
+            "session-tid", "ref-session-id"}
+
+
+def mask_value(key, value):
+    """按字段名脱敏。字段名不认识时原样返回（长度等非敏感信息保留）。"""
+    name = str(key or "").strip().lower().replace("_", "-")
+    text = "" if value is None else str(value)
+
+    if name in _LEN_ONLY:
+        return "<len=%d>" % len(text)
+    if name == "caller-detail":
+        return "<len=%d sha256:%s>" % (
+            len(text), hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:8])
+    if name in ("user-id", "userid", "email", "member-account"):
+        if "@" in text:
+            local, _, domain = text.partition("@")
+            return (local[:1] or "*") + "***@" + domain
+        return "***"
+    if name in _KEEP_TAIL:
+        keep = max(0, LOG_MASK_TAIL)
+        if keep == 0 or len(text) <= keep:
+            return "***"
+        return "*" * (len(text) - keep) + text[-keep:]
+    if name in _FULL_MASK:
+        return "***"
+    if name in _PREFIX8:
+        return (text[:8] + "…") if len(text) > 8 else "…"
+    return value
+
+
+def mask_obj(obj, depth=0):
+    """递归脱敏：dict 按键名、list 逐项。"""
+    if depth > 6:
+        return "…"
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k] = mask_obj(v, depth + 1) if isinstance(v, (dict, list)) \
+                else mask_value(k, v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [mask_obj(x, depth + 1) for x in obj]
+    return obj
+
+
+def _fmt_ts(t):
+    base = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    return base + (".%03d" % int((t % 1) * 1000) if LOG_TS_MS else "")
+
+
+_LEAD_KEYS = ("stage", "method", "url", "host", "proxy", "route_source", "status",
+              "ms", "code", "message", "tag", "event", "what", "step", "ok",
+              "type", "where", "source", "detail", "value_len", "keys")
+
+
+def _render(ev, mask):
+    kind, fields = ev["kind"], dict(ev["f"])
+    if mask:
+        fields = mask_obj(fields)
+    lead = []
+    for key in _LEAD_KEYS:
+        if key in fields:
+            lead.append("%s=%s" % (key, fields.pop(key)))
+    head = "%s  #%04d [%-5s]" % (_fmt_ts(ev["t"]), ev["seq"], kind)
+    lines = [head + ("  " + " ".join(lead) if lead else "")]
+    for key, val in fields.items():
+        if isinstance(val, (dict, list)):
+            lines.append("      %-12s %s"
+                         % (key, json.dumps(val, ensure_ascii=False)))
+        else:
+            lines.append("      %-12s %s" % (key, val))
+    return lines
+
+
+def render_ui(ev):
+    """界面渲染：明文，绝对坦诚。"""
+    return _render(ev, mask=False)
+
+
+def render_report(ev, reveal=None):
+    """导出渲染：字段级脱敏。reveal=True 时明文（log.export_reveal_secrets 可覆盖默认）。"""
+    if reveal is None:
+        reveal = LOG_EXPORT_REVEAL
+    return _render(ev, mask=not reveal)
+
+
+# ---- 落盘反馈日志（默认关闭；开启后超限自动换新文件） ----
+_LOG_FILE = {"path": None, "size": 0}
+_LOG_FILE_LOCK = threading.Lock()
+
+
+def _write_log_file(ev):
+    """log.file_enabled 打开时把事件实时落盘（走脱敏渲染器）。"""
+    if not LOG_FILE_ENABLED:
+        return
+    try:
+        with _LOG_FILE_LOCK:
+            path = _LOG_FILE["path"]
+            limit = max(1, LOG_FILE_MAX_MB) * 1048576
+            if path is None or _LOG_FILE["size"] > limit:
+                path = _APP_DIR / ("czn-lite-session-%s.log"
+                                   % time.strftime("%Y%m%d-%H%M%S"))
+                _LOG_FILE["path"] = path
+                fresh = not path.exists()
+                _LOG_FILE["size"] = path.stat().st_size if not fresh else 0
+                if fresh:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write("CZN Launcher Lite 会话日志（已脱敏）\n")
+                        f.write("启动 %s | 版本 %s | 脱敏 %s\n"
+                                % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   APP_VERSION or "(未标注)",
+                                   "关（明文）" if LOG_EXPORT_REVEAL else "开"))
+                        _LOG_FILE["size"] = f.tell()
+            text = "\n".join(render_report(ev)) + "\n"
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+            _LOG_FILE["size"] += len(text.encode("utf-8"))
+    except Exception:
+        pass
+
+
+def env_snapshot():
+    """环境快照：系统代理 / PAC / 环境变量 / 最终路径决策。"""
+    snap = {"network_mode": NET_MODE}
+    if not LOG_ENV_SNAPSHOT:
+        return snap
+    cfg = _system_proxy_static()
+    if cfg:
+        proxy, bypass, pac_url, autodetect = cfg
+        snap["system_proxy"] = proxy or "(未启用)"
+        snap["system_bypass"] = bypass[:200]
+        snap["pac_url"] = pac_url or "(无)"
+        snap["autodetect"] = autodetect
+    else:
+        snap["system_proxy"] = "(读取失败)"
+    snap["env_proxy"] = {k: os.environ[k] for k in
+                         ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                          "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+                         if os.environ.get(k)} or "(未设置)"
+    snap["verify_tls"] = NET_VERIFY_TLS
+    snap["route"] = network_summary()
+    return snap
+
+
+def export_report(out_dir=None, revealed=None):
+    """把结构化事件渲染成反馈日志并落盘。返回写入路径。
+
+    revealed 为 None 时按 log.export_reveal_secrets 决定是否脱敏。
+    """
+    out_dir = Path(out_dir) if out_dir else _APP_DIR
+    reveal = LOG_EXPORT_REVEAL if revealed is None else bool(revealed)
+    name = "czn-lite-report-%s%s.txt" % (
+        (APP_VERSION + "-") if APP_VERSION else "",
+        time.strftime("%Y%m%d-%H%M%S"))
+    path = out_dir / name
+
+    lines = []
+    lines.append("CZN Launcher Lite 反馈日志")
+    lines.append("生成时间 : %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("版本     : %s" % (APP_VERSION or "(未标注)"))
+    lines.append("可执行   : %s" % sys.executable)
+    lines.append("冻结运行 : %s" % bool(getattr(sys, "frozen", False)))
+    lines.append("脱敏状态 : %s" % ("★ 未脱敏（含明文凭据，切勿外发）" if reveal
+                                    else "已脱敏，可直接发送"))
+    lines.append("说明     : 本文件按字段级规则脱敏：令牌/密码只保留长度，"
+                 "邮箱保留首字母与域名，member_no/guid 保留后几位，"
+                 "会话类 ID 保留前 8 位。")
+    lines.append("")
+    if LOG_ENV_SNAPSHOT:
+        lines.append("---- 环境快照 ----")
+        for key, val in env_snapshot().items():
+            lines.append("%-14s %s" % (key, val))
+        lines.append("")
+    lines.append("---- 事件流 ----")
+    for ev in events():
+        lines.extend(render_report(ev, reveal=reveal))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _record_api(tag, status, data):
+    """把一次 API 响应的要点记成事件（token 只记原文，导出时按字段名脱敏）。"""
+    fields = {"stage": stage(), "tag": tag, "status": status}
+    if isinstance(data, dict):
+        fields["code"] = data.get("code")
+        fields["message"] = str(data.get("message") or "")[:120]
+        value = data.get("value")
+        if isinstance(value, dict):
+            fields["keys"] = sorted(value.keys())[:20]
+            for key in ("access_token", "refresh_token"):
+                if value.get(key):
+                    fields[key] = value[key]
+    record("api", **fields)
 
 # ---- 路径规范化与校验 ----
 # 用户填 install_root 的方式千奇百怪：正斜杠、尾部多一个反斜杠、带引号、
@@ -527,6 +1150,51 @@ def clear_device_config():
     set_install_root("")
 
 
+# ---- 网络设置（界面可改，写回 config.json 并即时生效） ----
+def network_config():
+    """当前网络设置（供界面回显）。"""
+    return {"mode": NET_MODE, "manual_url": NET_MANUAL_URL,
+            "manual_username": NET_MANUAL_USER,
+            "manual_password": NET_MANUAL_PASS,
+            "manual_bypass": NET_MANUAL_BYPASS}
+
+
+def save_network_config(mode=None, manual_url=None, manual_username=None,
+                        manual_password=None, manual_bypass=None):
+    """只改 network 段的这几个键，其余配置保持不变；写完清路由缓存即时生效。"""
+    data = {}
+    if _CONFIG_FILE.exists():
+        try:
+            data = _loads_config(
+                _decode_config(_CONFIG_FILE.read_bytes()) or "") or {}
+        except OSError:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    node = data.get("network")
+    if not isinstance(node, dict):
+        node = {}
+        data["network"] = node
+    for key, value in (("mode", mode), ("manual_url", manual_url),
+                       ("manual_username", manual_username),
+                       ("manual_password", manual_password),
+                       ("manual_bypass", manual_bypass)):
+        if value is not None:
+            node[key] = value
+    _CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+
+    global NET_MODE, NET_MANUAL_URL, NET_MANUAL_USER, NET_MANUAL_PASS, \
+        NET_MANUAL_BYPASS
+    NET_MODE = str(node.get("mode", NET_MODE) or "direct").strip().lower()
+    NET_MANUAL_URL = str(node.get("manual_url", NET_MANUAL_URL) or "")
+    NET_MANUAL_USER = str(node.get("manual_username", NET_MANUAL_USER) or "")
+    NET_MANUAL_PASS = str(node.get("manual_password", NET_MANUAL_PASS) or "")
+    NET_MANUAL_BYPASS = str(node.get("manual_bypass", NET_MANUAL_BYPASS) or "")
+    reset_route_cache()
+    return network_config()
+
+
 # ====================================================================
 # 0. 账号密码登录用的密码字段变换
 # --------------------------------------------------------------------
@@ -558,6 +1226,77 @@ def stove_password_field(password, pine_key=PINE_ENCRYPT_KEY):
 #        → 384 字符游戏级令牌（REQUIRED_INFO 必须使用它，否则 41002）
 # 游戏级响应中的 value.user.user_id 即 REQUIRED_INFO 的 guid（与 member_no 不同）。
 # ====================================================================
+class _LoggedSession:
+    """包一层 curl_cffi Session：统一解析网络路径 + 记录请求/响应事件。
+
+    这样全部调用点（czn_lite 的 11 处 + captcha 的 3 处）零改动即可获得
+    路由决策与详细日志 —— 「全覆盖」是结构性的，不会漏点。
+    """
+
+    def __init__(self, session):
+        self._s = session
+
+    # ---- 属性透传（调用方仍在用 .headers 等） ----
+    @property
+    def headers(self):
+        return self._s.headers
+
+    @property
+    def cookies(self):
+        return self._s.cookies
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+    def get(self, url, **kw):
+        return self._request("GET", url, **kw)
+
+    def post(self, url, **kw):
+        return self._request("POST", url, **kw)
+
+    def request(self, method, url, **kw):
+        return self._request(method, url, **kw)
+
+    def _request(self, method, url, **kw):
+        route = resolve_route(url)
+        # ★ 必须显式传：直连时为 {"all": ""}，否则被环境变量静默劫持
+        kw.setdefault("proxies", route.proxies)
+        # 超时统一成 (连接, 读取)：连接上界取 network.connect_timeout，
+        # 读取沿用调用方给的值（调用方给的是总超时，这里只补连接上界）
+        read_t = kw.get("timeout") or NET_READ_TIMEOUT
+        if NET_CONNECT_TIMEOUT > 0 and isinstance(read_t, (int, float)):
+            kw["timeout"] = (min(NET_CONNECT_TIMEOUT, read_t), read_t)
+        else:
+            kw["timeout"] = read_t
+        if not NET_VERIFY_TLS:
+            kw["verify"] = False
+        if NET_RETRY:
+            kw.setdefault("retry", NET_RETRY)
+
+        body = kw.get("json")
+        # 实际发出的请求头 = 会话级 + 本次请求级（调用方都用后者）
+        sent_headers = dict(self._s.headers or {})
+        sent_headers.update(kw.get("headers") or {})
+        record("req", stage=stage(), method=method, url=url, host=route.host,
+               proxy=(route.proxies.get("all") or "直连"),
+               route_source=route.source,
+               headers=sent_headers,
+               body=body if isinstance(body, dict) else None,
+               params=kw.get("params"))
+        started = time.time()
+        try:
+            resp = self._s.request(method, url, **kw)
+        except Exception as e:
+            record("error", stage=stage(), where="%s %s" % (method, url),
+                   type=type(e).__name__, message=str(e)[:400],
+                   ms=int((time.time() - started) * 1000))
+            raise
+        record("resp", stage=stage(), method=method, host=route.host,
+               status=getattr(resp, "status_code", None),
+               ms=int((time.time() - started) * 1000))
+        return resp
+
+
 class StoveAuth:
     """STOVE 认证：二维码登录 → 令牌续期 → 游戏级令牌兑换。"""
 
@@ -568,8 +1307,10 @@ class StoveAuth:
         #   default_headers=False  关闭 libcurl 注入的 Chrome 浏览器头
         #   http_version=HTTP/1.1  官方所有端点均为 HTTP/1.1（Chrome 指纹默认 h2）
         #   会话头清空，每个请求经 _official_headers() 按官方线序完整构造
-        self.s = requests.Session(impersonate="chrome", default_headers=False,
-                                  http_version=CurlHttpVersion.V1_1)
+        # 再包一层 _LoggedSession：统一解析网络路径 + 记录请求/响应事件
+        self.s = _LoggedSession(requests.Session(
+            impersonate="chrome", default_headers=False,
+            http_version=CurlHttpVersion.V1_1))
         self.s.headers.clear()
         self.gds = gds or dict(GDS_INFO)
         # 官方一次启动会话内所有请求共用同一个 Transaction-ID，且 gc/check
@@ -650,6 +1391,8 @@ class StoveAuth:
         except Exception:
             raise RuntimeError("[%s] 非 JSON 响应 %d: %s"
                                % (tag, response.status_code, response.text[:200]))
+        # 事件记录：界面明文、导出按字段名脱敏（access_token / refresh_token 等）
+        _record_api(tag, response.status_code, data)
         limit = 2000 if ("signin" in tag or "refresh" in tag) else 400
         print("[dbg][%s] HTTP %d: %s"
               % (tag, response.status_code,
@@ -661,6 +1404,7 @@ class StoveAuth:
     # ---- 二维码登录 ----
     def qr_create(self):
         """申请扫码登录二维码。官方请求体恰为 4 键（不含 client_id/service_id）。"""
+        set_stage("扫码登录")
         body = {"login_type": "QR_LOGIN_LAUNCHER", "gds_info": self.gds,
                 "width": 180, "height": 180}
         r = self.s.post(API + "/auth-secure/v1.0/qr", json=body,
@@ -676,6 +1420,7 @@ class StoveAuth:
 
     def signin_qr(self, qr_session):
         """扫码成功后的登录确认。"""
+        set_stage("扫码登录")
         return self._signin("QR", {"qr_login_session": qr_session})
 
     # ---- 账号密码登录（provider_cd="SO"）----
@@ -684,6 +1429,7 @@ class StoveAuth:
     # 返回响应 dict 而不抛异常：49700 表示需要验证码，是正常中间态。
     def signin_password(self, user_id, password, captcha_token=None):
         """账号密码登录。返回响应 dict；`code==49700` 表示需要验证码。"""
+        set_stage("账号密码登录")
         body = {"client_id": CLIENT_ID, "service_id": "Launcher",
                 "provider_cd": "SO",
                 "provider_data": {"user_id": user_id,
@@ -823,6 +1569,7 @@ class StoveAuth:
 
         成功返回 (access_token, refresh_token, member, user)；
         失败返回 None。refresh_token 每次轮换，调用方必须保存新值。"""
+        set_stage("令牌续期")
         if not self.launcher_refresh:
             print("[!] 没有可用的 refresh_token，跳过续期")
             return None
@@ -860,6 +1607,7 @@ class StoveAuth:
           · 鉴权只认 299 字符启动器级令牌（384 游戏级令牌会被 400000 拒绝）
           · device_key 与请求头 Transaction-ID 是同一个会话级 UUID
         返回 (http_status, json 或 None, 原始文本)。"""
+        set_stage("兑换游戏级令牌")
         body = {
             "device_info": {"device_key": str(self.session_tid)},
             "gds_info": {
