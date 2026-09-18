@@ -101,6 +101,19 @@ class Manifest:
     raw: dict = field(default_factory=dict)
 
     @property
+    def main_exe(self) -> str:
+        """游戏主程序（安装内相对路径，正斜杠）。
+
+        官方 execution 形如 "<加载器> <游戏本体>"，**取最后一个 token 即可** ——
+        最后那个就是被补丁/汉化改过的文件。用官方字段而不是猜，逻辑只有一行。
+        例：bin\\ucldr_..._loader_x64.exe bin\\ssr-stove-shield.exe → bin/ssr-stove-shield.exe
+        """
+        toks = str(self.execution or "").strip().split()
+        if not toks:
+            return ""
+        return toks[-1].strip('"').replace("\\", "/").lstrip("/")
+
+    @property
     def files(self) -> list:
         return [e for e in self.entries if e.kind == "F"]
 
@@ -134,10 +147,13 @@ class Plan:
     removes: list = field(default_factory=list)
     mkdirs: list = field(default_factory=list)
     generates: list = field(default_factory=list)
-    missing: list = field(default_factory=list)      # 文件不存在
-    modified: list = field(default_factory=list)     # 存在但与清单不符（被改过）
+    missing: list = field(default_factory=list)      # 文件不存在 → 必须补
+    damaged: list = field(default_factory=list)      # 大小不符 → 视为损坏，必须修
+    modified: list = field(default_factory=list)     # 大小相同但内容不同 → 通常是补丁/汉化
+    kept: list = field(default_factory=list)         # 决定保留不动的（补丁/汉化，同版本）
     intact: int = 0                                  # 已通过校验、无需动作的文件数
     source: str = ""                                 # 判定依据，进日志
+    upgraded: bool = False                           # 本次是否为「大更新」（版本号变化）
 
     @property
     def total_packed(self) -> int:
@@ -400,32 +416,42 @@ def _session(session=None):
         http_version=cl.CurlHttpVersion.V1_1))
 
 
+class _HttpError(Exception):
+    """带状态码的 HTTP 错误（curl_cffi 不抛 HTTPError，自己带一个，便于按码分流）。"""
+
+    def __init__(self, code, url=""):
+        super().__init__("HTTP %s" % code)
+        self.code = int(code)
+        self.url = url
+
+
 def _get_bytes(url, session=None, timeout=30):
     s = _session(session)
     r = s.get(url, timeout=timeout)
     if getattr(r, "status_code", 0) != 200:
-        raise RuntimeError("HTTP %s" % r.status_code)
+        raise _HttpError(r.status_code, url)
     return r.content
 
 
 def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_AHEAD):
-    """免鉴权兜底：从 start 起递增探测清单，返回最新可用版本。
+    """免鉴权兜底：从 start 起递增探测清单，返回 (最新版本, 错误说明)。
 
-    官方游戏 CDN 对不存在的版本返回 404；启动器 CDN 返回 403 —— 两者都视为「不存在」。
+    **只有 404 才代表「该版本不存在」**（到达边界，可正常结束）。
+    其它情况（403 被 CDN 拦、网络异常）都返回错误说明 —— 绝不能悄悄当成
+    「没有更新」，否则 CDN 一限流就会谎报「已是最新」。
     """
     best = 0
     for n in range(start, start + limit + 1):
-        url = manifest_url_tpl % n
         try:
-            _get_bytes(url, session, timeout=15)
+            _get_bytes(manifest_url_tpl % n, session, timeout=15)
             best = n
-        except urllib.error.HTTPError as exc:
-            if exc.code in (403, 404):
-                break
-            break
-        except Exception:
-            break
-    return best
+        except (_HttpError, urllib.error.HTTPError) as exc:
+            if int(getattr(exc, "code", 0)) == 404:
+                return best, ""
+            return best, "HTTP %s（CDN 可能限流或拦截）" % getattr(exc, "code", "?")
+        except Exception as exc:
+            return best, "探测失败：%s" % exc
+    return best, ""
 
 
 # ====================================================================
@@ -480,15 +506,19 @@ def verify_all(root: str, manifest: Manifest, on_event=None, cancel=None):
 # ====================================================================
 # 计划
 # ====================================================================
-def plan_update(root: str, manifest: Manifest, source="", on_event=None, mode="full"):
+def plan_update(root: str, manifest: Manifest, source="", on_event=None, mode="full",
+                replace_modified=False, upgraded=False):
     """按清单生成本次要做的动作。
 
-    mode='full'  逐文件算 MD5（等价官方 IIV_EXIST_HASH，默认）
-    mode='quick' 只比 cacheii.db 的记录，不读文件内容（快，但发现不了文件被改）
+    mode='full'        逐文件算 MD5（等价官方 IIV_EXIST_HASH，默认）
+    mode='quick'       只比 cacheii.db 的记录，不读文件内容（快，但发现不了文件被改）
+    replace_modified   是否替换「存在但与官方不符」的文件：
+                       · 大更新（版本号变了）必须为 True —— 否则旧的主程序会留下来
+                       · 同版本默认 False —— 这类文件通常是用户的补丁/汉化，不能当损坏修掉
     """
     log = on_event or (lambda m: None)
     cache = read_cache(root)
-    plan = Plan(target_version=manifest.version, source=source)
+    plan = Plan(target_version=manifest.version, source=source, upgraded=upgraded)
 
     def _judge(e):
         if mode == "full":
@@ -509,14 +539,27 @@ def plan_update(root: str, manifest: Manifest, source="", on_event=None, mode="f
             if cached != (e.size, e.md5):
                 log("[计划] 文件正确但账本不符，将回写：%s" % e.rel)
             continue
-        # 「缺失」与「被改过」必须分开 —— 后者意味着会覆盖用户的改动（如第三方补丁）
-        if os.path.exists(e.at(root)):
-            plan.modified.append(e)
-            log("[计划] 已被修改：%s（%s）" % (e.rel, why))
-        else:
+
+        p = e.at(root)
+        if not os.path.isfile(p):
             plan.missing.append(e)
             log("[计划] 缺失：%s" % e.rel)
-        plan.downloads.append(e)
+            plan.downloads.append(e)
+            continue
+
+        # 存在但与官方不符。补丁/汉化是**定长重建**（大小不变），所以：
+        #   大小不符 = 损坏，必须修；大小相同 = 用户改动，同版本下保留
+        plan.modified.append(e)
+        if e.size and os.path.getsize(p) != e.size:
+            plan.damaged.append(e)
+            log("[计划] 大小不符，按损坏处理：%s（%s）" % (e.rel, why))
+            plan.downloads.append(e)
+        elif replace_modified:
+            log("[计划] 与官方不同，将覆盖：%s（%s）" % (e.rel, why))
+            plan.downloads.append(e)
+        else:
+            plan.kept.append(e)
+            log("[计划] 与官方不同（通常是补丁/汉化），保留不动：%s（%s）" % (e.rel, why))
 
     for e in manifest.dirs:
         if not os.path.isdir(e.at(root)):
@@ -792,7 +835,8 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
     if url:
         probe_url = url.rsplit("/", 1)[0] + "/STOVE_CHAOSZERO_%d.json"
 
-    live, source = 0, ""
+    live, source, probe_error = 0, "", ""
+    determined = False
     try:
         api = ("%s/dpms/game/v3.1/live_version?game_id=%s&local_version=%d&pc_room=false"
                % (cl.API, cl.GAME_ID, ver))
@@ -801,18 +845,28 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
         live = int(val.get("live_version") or 0)
         url = str(val.get("live_project_file_url") or url)
         source = "DPMS API"
+        determined = bool(live)
         log("[更新] 服务端最新版本 %d（%s）" % (live, source))
     except Exception as exc:
         log("[更新] 版本接口不可用（%s）" % exc)
         if allow_probe and probe_url:
-            probed = probe_latest_version(probe_url, ver + 1, session)
-            if probed:
-                live = probed
-                url = probe_url % probed
-                source = "清单探测"
-                log("[更新] 探测到最新版本 %d（%s）" % (live, source))
+            probed, perr = probe_latest_version(probe_url, ver + 1, session)
+            if perr:
+                probe_error = perr
+                log("[更新] 清单探测不可用：%s" % perr)
+            else:
+                # 探测到达 404 边界 = 确定「没有更新的版本」
+                determined = True
+                if probed:
+                    live = probed
+                    url = probe_url % probed
+                    source = "清单探测"
+                    log("[更新] 探测到最新版本 %d（%s）" % (live, source))
+                else:
+                    log("[更新] 探测确认：没有更新的版本")
 
     return {"local": ver, "live": live, "need_update": bool(live and live > ver),
+            "determined": determined, "probe_error": probe_error,
             "manifest_url": url, "probe_url": probe_url,
             "note": note, "source": source, "root": root}
 
@@ -832,25 +886,52 @@ def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=Non
     log("[校验] 清单 %s（版本 %d，%d 条）" % (used.split("?")[0], man.version, len(man.entries)))
     ok, bad = verify_all(root, man, on_event=log, cancel=cancel)
     total = len(man.files)
-    if bad:
-        miss = [b for b in bad if b[1] == "缺失"]
-        mod = [b for b in bad if b[1] != "缺失"]
-        return Result(False, "完整性校验：%d/%d 通过（缺失 %d，被修改 %d）"
-                      % (ok, total, len(miss), len(mod)), version=man.version)
-    return Result(True, "完整性校验通过（%d/%d）" % (ok, total), version=man.version)
+    if not bad:
+        return Result(True, "完整性校验通过（%d/%d）" % (ok, total), version=man.version)
+
+    # 三类分开看：缺失/损坏要修；「大小相同但内容不同」通常是补丁/汉化，不算异常
+    miss, dmg, mod = [], [], []
+    for e, why in bad:
+        p = e.at(root)
+        if not os.path.isfile(p):
+            miss.append((e, why))
+        elif e.size and os.path.getsize(p) != e.size:
+            dmg.append((e, why))
+        else:
+            mod.append((e, why))
+
+    if mod:
+        log("[校验] 与官方不同但大小一致（通常是补丁/汉化，不视为异常）：")
+        for e, why in mod:
+            log("[校验]     %s%s" % (e.rel,
+                                     "  ← 游戏主程序"
+                                     if e.rel.replace(os.sep, "/") == man.main_exe else ""))
+    bad_n = len(miss) + len(dmg)
+    if bad_n:
+        return Result(False, "完整性校验：%d/%d 通过（缺失 %d，损坏 %d，与官方不同 %d）"
+                      % (ok, total, len(miss), len(dmg), len(mod)), version=man.version)
+    return Result(True, "完整性校验通过：%d/%d 一致，另有 %d 个文件与官方不同（已保留）"
+                  % (ok, total, len(mod)), version=man.version)
 
 
 def update(root=None, session=None, on_event=None, cancel=None,
            workers=None, resume=None, backup=None, dry_run=False,
            on_progress=None, force=False, manifest_url=None,
-           preserve_modified=None):
+           restore_modified=None):
     """完整流程：检查 → 计划 → 执行。
 
     参数为 None 时从 config.json 的 update 段取默认值。
 
-    force=True              忽略版本比较，直接用当前清单做一次全量比对（「修复」）。
-    manifest_url=...        直接指定清单，跳过版本检查（排障 / 离线 / 自检用）。
-    preserve_modified=True  保留本地被改动过的文件（不覆盖），只在日志里报告。
+    force=True               忽略版本比较，直接用当前清单做一次全量比对（「修复」）。
+    manifest_url=...         直接指定清单，跳过版本检查（排障 / 离线 / 自检用）。
+    restore_modified=True    同版本时也把「与官方不同」的文件恢复成官方原版。
+
+    关于「与官方不同」的文件：
+      · 大更新（版本号变了）→ 一律按官方清单替换，包括被补丁/汉化改过的游戏主程序；
+        日志会逐个点名，并提示更新后需要重新补丁与汉化。
+      · 同版本（只是校验/修复）→ 默认**保留不动**：那些文件通常就是补丁与汉化，
+        不能当成损坏去「修」，否则会误杀。
+      · 热更（bin\\appdata\\cznlive）由游戏自己管，两种情况下都不碰，因此热补丁后无需重新补丁。
     """
     log = on_event or (lambda m: None)
     root = _root(root)
@@ -863,12 +944,13 @@ def update(root=None, session=None, on_event=None, cancel=None,
         resume = _u_bool("resume", True)
     if backup is None:
         backup = _u_bool("backup_before_replace", True)
-    if preserve_modified is None:
-        preserve_modified = _u_bool("preserve_modified", False)
+    if restore_modified is None:
+        restore_modified = _u_bool("restore_modified", False)
 
     if manifest_url:
         man_url, source = manifest_url, "指定清单"
-        info = {"local": local_version(root)[0], "source": source}
+        local_ver = local_version(root)[0]
+        info = {"local": local_ver, "source": source}
     else:
         info = check(root, session, on_event=log)
         if info.get("error"):
@@ -876,9 +958,15 @@ def update(root=None, session=None, on_event=None, cancel=None,
         man_url = info.get("manifest_url")
         if not man_url:
             return Result(False, "没有可用的清单地址")
+        local_ver = info["local"]
         if not force and not info["need_update"]:
-            log("[更新] 已是最新版本 %d" % info["local"])
-            return Result(True, "已是最新版本 %d" % info["local"], version=info["local"])
+            if info.get("determined"):
+                log("[更新] 已是最新版本 %d" % local_ver)
+                return Result(True, "已是最新版本 %d" % local_ver, version=local_ver)
+            # 接口与探测都不可用 —— 不能谎报「已是最新」，明确说清
+            why = info.get("probe_error") or "版本接口不可用"
+            log("[更新] 无法确认最新版本：%s" % why)
+            return Result(False, "无法确认最新版本（%s）" % why)
 
     mode = _u_str("verify_mode", "full").lower()
     if mode not in ("full", "quick"):
@@ -886,24 +974,39 @@ def update(root=None, session=None, on_event=None, cancel=None,
         mode = "full"
 
     man, used = fetch_manifest(man_url, session)
-    log("[更新] 目标版本 %d（%d 条记录，其中受管文件 %d 个）"
-        % (man.version, len(man.entries), len(man.files)))
+    upgraded = bool(man.version and local_ver and man.version != local_ver)
+    log("[更新] 目标版本 %d（%d 条记录，其中受管文件 %d 个）%s"
+        % (man.version, len(man.entries), len(man.files),
+           "  ← 大更新（本地 %d）" % local_ver if upgraded else ""))
+    if man.main_exe:
+        log("[更新] 游戏主程序：%s" % man.main_exe)
 
-    plan = plan_update(root, man, source=info.get("source", ""), on_event=log, mode=mode)
-    log("[更新] 计划：下载 %d（缺失 %d / 被修改 %d）/ 删除 %d / 建目录 %d / 占位 %d（已就绪 %d）"
-        % (len(plan.downloads), len(plan.missing), len(plan.modified),
-           len(plan.removes), len(plan.mkdirs), len(plan.generates), plan.intact))
+    plan = plan_update(root, man, source=info.get("source", ""), on_event=log, mode=mode,
+                       replace_modified=upgraded or restore_modified, upgraded=upgraded)
+    log("[更新] 计划：下载 %d（缺失 %d / 损坏 %d / 与官方不同 %d）/ 保留 %d / 删除 %d / 建目录 %d / 占位 %d（已就绪 %d）"
+        % (len(plan.downloads), len(plan.missing), len(plan.damaged), len(plan.modified),
+           len(plan.kept), len(plan.removes), len(plan.mkdirs),
+           len(plan.generates), plan.intact))
 
-    # 被修改过的文件（例如用户自己打过补丁）会被官方原版覆盖 —— 必须说清楚
-    if plan.modified:
-        log("[更新] 注意：以下 %d 个文件不是官方原版，更新将覆盖它们："
-            % len(plan.modified))
+    main_rel = man.main_exe
+
+    def _tag(e):
+        return "  ← 游戏主程序" if e.rel.replace(os.sep, "/") == main_rel else ""
+
+    if plan.kept:
+        log("[更新] 以下 %d 个文件与官方不同（通常是补丁/汉化），本次保持不动："
+            % len(plan.kept))
+        for e in plan.kept:
+            log("[更新]     %s%s" % (e.rel, _tag(e)))
+    if upgraded and plan.modified:
+        log("[更新] ★ 大更新：以下文件含你的补丁/汉化，将被官方原版覆盖 ——"
+            " 更新后请重新补丁与汉化：")
         for e in plan.modified:
-            log("[更新]     %s" % e.rel)
-        if preserve_modified:
-            keep = {e.idx for e in plan.modified}
-            plan.downloads = [e for e in plan.downloads if e.idx not in keep]
-            log("[更新] 已按配置保留上述文件（未替换）；其余照常处理")
+            log("[更新]     %s%s" % (e.rel, _tag(e)))
+    elif plan.modified and restore_modified:
+        log("[更新] 已按配置把 %d 个与官方不同的文件恢复为官方原版：" % len(plan.modified))
+        for e in plan.modified:
+            log("[更新]     %s%s" % (e.rel, _tag(e)))
 
     if dry_run:
         return Result(True, "演练完成（未做任何改动）", version=man.version, plan=plan)
@@ -1019,7 +1122,8 @@ def _selftest_env(tmp):
         "6 | R | /bin/gone.dll",
     ]
     man = {"service_code": cl.GAME_ID, "service_name": "SelfTest",
-           "version_no": 7, "root_folder": "SelfTest", "execution": "bin/a.dll",
+           "version_no": 7, "root_folder": "SelfTest",
+           "execution": "bin/ucldr_test_loader.exe bin/a.dll",
            "extract_size": str(sa[0] + sb[0] + sc[0]),
            "packed_size": str(sa[1] + sb[1] + sc[1]),
            "files": files}
@@ -1056,6 +1160,12 @@ def _selftest_env(tmp):
 
         def log_message(self, *a):
             pass
+
+        def do_GET(self):
+            if self.path.startswith("/blocked"):
+                self.send_error(403, "Access Denined")      # 模拟 CDN 拦截
+                return
+            super().do_GET()
 
     httpd = socketserver.TCPServer(("127.0.0.1", 0), H)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -1096,6 +1206,8 @@ def selftest():
                                          len(man.generates), len(man.removes)))
             chk("大小合计吻合", man.total_size == int(man.raw["extract_size"])
                 and man.total_packed == int(man.raw["packed_size"]))
+            chk("主程序识别（取官方 execution 最后一个 exe）",
+                man.main_exe == "bin/a.dll", man.main_exe)
 
             # ② URL 推导
             e = man.files[0]
@@ -1202,9 +1314,11 @@ def selftest():
                             for x in man.raw["files"]]
             chk("列数自适应", len(parse_manifest(m16).files) == 3)
 
-            # ⑭ 版本探测兜底（本地 CDN 没有这些名字，遇 404 应立刻停止）
-            probed = probe_latest_version(base + "/none_%d.json", 1, limit=3)
-            chk("探测兜底遇 404 停止", probed == 0, "返回 %d" % probed)
+            # ⑭ 探测兜底：404 = 版本不存在（正常边界）；403 = 被 CDN 拦，必须报错
+            probed, perr = probe_latest_version(base + "/none_%d.json", 1, limit=3)
+            chk("探测：404 到达边界", probed == 0 and perr == "", repr(perr))
+            probed2, perr2 = probe_latest_version(base + "/blocked_%d.json", 1, limit=3)
+            chk("探测：403 报错不谎报", probed2 == 0 and "403" in perr2, repr(perr2))
 
             # ⑮ 磁盘空间可读
             chk("磁盘空间可读", disk_free(root) is not None)
@@ -1221,26 +1335,46 @@ def selftest():
             except Exception as exc:
                 chk("404 报错", "404" in str(exc), str(exc)[:44])
 
-            # ⑰ 「缺失」与「被修改」必须分开（后者会覆盖用户改动）
+            # ⑰ 补丁/汉化必须与「缺失/损坏」分开
+            #    补丁 = 定长重建 ⇒ 大小不变、内容不同 ⇒ 同版本下保留，不能当损坏误杀
+            PAT = b"patched-" + b"x" * (len(b"alpha" * 100) - 8)   # 等长、内容不同
             with open(os.path.join(root, "bin", "a.dll"), "wb") as f:
-                f.write(b"user-patched")            # 存在但内容不同
-            os.remove(os.path.join(root, "bin", "b.dll"))   # 直接删掉
+                f.write(PAT)                                        # 补丁
+            os.remove(os.path.join(root, "bin", "b.dll"))           # 缺失
+            with open(os.path.join(root, "bin", "c.dll"), "wb") as f:
+                f.write(b"short")                                   # 大小不符 = 损坏
             p3 = plan_update(root, man, on_event=lambda m: None)
-            chk("分类-被修改", [x.rel for x in p3.modified] == ["bin" + os.sep + "a.dll"],
+            chk("分类-与官方不符（全集）",
+                sorted(x.rel for x in p3.modified)
+                == sorted(["bin" + os.sep + "a.dll", "bin" + os.sep + "c.dll"]),
                 [x.rel for x in p3.modified])
-            chk("分类-缺失", [x.rel for x in p3.missing] == ["bin" + os.sep + "b.dll"],
-                [x.rel for x in p3.missing])
+            chk("识别缺失", [x.rel for x in p3.missing] == ["bin" + os.sep + "b.dll"])
+            chk("识别损坏（大小不符）",
+                [x.rel for x in p3.damaged] == ["bin" + os.sep + "c.dll"])
+            chk("同版本保留补丁",
+                [x.rel for x in p3.kept] == ["bin" + os.sep + "a.dll"]
+                and sorted(x.rel for x in p3.downloads)
+                == sorted(["bin" + os.sep + "b.dll", "bin" + os.sep + "c.dll"]))
             rv3 = verify(root, manifest_url=used, on_event=lambda m: None)
-            chk("校验报告分类", (not rv3.ok) and "缺失 1" in rv3.message
-                and "被修改 1" in rv3.message, rv3.message)
-            rp = update(root, manifest_url=used, force=True,
-                        preserve_modified=True, on_event=lambda m: None)
-            chk("preserve_modified 生效", rp.ok and rp.downloaded == 1
-                and md5_file(os.path.join(root, "bin", "a.dll"))
-                == hashlib.md5(b"user-patched").hexdigest(),
-                "只重下缺失的 %d 个" % rp.downloaded)
-            rq = update(root, manifest_url=used, force=True, on_event=lambda m: None)
-            chk("默认会覆盖被修改文件", rq.ok and rq.downloaded == 1
+            chk("校验：只缺/损才算异常", (not rv3.ok)
+                and "缺失 1" in rv3.message and "损坏 1" in rv3.message
+                and "与官方不同 1" in rv3.message, rv3.message)
+            rp = update(root, manifest_url=used, force=True, on_event=lambda m: None)
+            chk("修复只补缺失与损坏、不动补丁",
+                rp.ok and rp.downloaded == 2
+                and md5_file(os.path.join(root, "bin", "a.dll")) == hashlib.md5(PAT).hexdigest(),
+                "重下 %d 个" % rp.downloaded)
+
+            # ⑰b 大更新（版本变了）→ 一律替换，含补丁
+            p4 = plan_update(root, man, replace_modified=True, upgraded=True)
+            chk("大更新替换补丁",
+                [x.rel for x in p4.downloads] == ["bin" + os.sep + "a.dll"]
+                and not p4.kept and p4.upgraded)
+
+            # ⑰c restore_modified=true → 同版本也恢复官方原版
+            rq = update(root, manifest_url=used, force=True, restore_modified=True,
+                        on_event=lambda m: None)
+            chk("restore_modified 生效", rq.ok and rq.downloaded == 1
                 and md5_file(os.path.join(root, "bin", "a.dll"))
                 == hashlib.md5(b"alpha" * 100).hexdigest(),
                 "重下 %d 个" % rq.downloaded)
@@ -1273,7 +1407,7 @@ def selftest():
 
             # ㉒ 配置项必须真的被读到（防止「声明了没接上」）
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
-                    "resume", "backup_before_replace", "preserve_modified",
+                    "resume", "backup_before_replace", "restore_modified",
                     "keep_temp", "probe_fallback", "check_vcredist")
             wired = [k for k in keys if _u_bool(k, None) is not None
                      or _u_str(k, "") != "" or _u_int(k, -1) != -1]

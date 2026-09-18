@@ -62,7 +62,7 @@
   "workers": 4,
   "resume": true,
   "backup_before_replace": true,
-  "preserve_modified": false,
+  "restore_modified": false,
   "keep_temp": false,
   "probe_fallback": true,
   "check_vcredist": true

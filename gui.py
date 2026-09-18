@@ -1168,11 +1168,16 @@ class App(ctk.CTk):
         r = upd.update(on_event=self.log_line, cancel=self._cancel.is_set,
                        on_progress=self._on_dl_progress, force=force)
         self.log_line("[%s] %s" % ("+" if r.ok else "x", r.message))
-        if r.plan is not None and r.plan.modified:
-            self.log_line("[!] 注意：以下 %d 个文件此前不是官方原版，已被覆盖："
-                          % len(r.plan.modified))
-            for e in r.plan.modified:
-                self.log_line("      %s" % e.rel)
+        if r.plan is not None:
+            if r.plan.kept:
+                self.log_line("[*] 保留 %d 个与官方不同的文件（补丁/汉化，未覆盖）：%s"
+                              % (len(r.plan.kept),
+                                 "、".join(e.rel for e in r.plan.kept)))
+            if r.plan.upgraded and r.plan.modified:
+                self.log_line("[!] 大更新已覆盖 %d 个含补丁/汉化的文件 —— "
+                              "请重新打补丁与汉化" % len(r.plan.modified))
+                for e in r.plan.modified:
+                    self.log_line("      %s" % e.rel)
         for e, why in r.failed:
             self.log_line("      - %s：%s" % (e.rel, why))
         self.set_status("状态: 更新完成" if r.ok else "状态: 更新失败")
@@ -1192,7 +1197,11 @@ class App(ctk.CTk):
             self.log_line("[!] %s" % info["error"])
             return True
         if not info["need_update"]:
-            self.log_line("[+] 游戏本体已是最新（%d）" % info["local"])
+            if info.get("determined"):
+                self.log_line("[+] 游戏本体已是最新（%d）" % info["local"])
+            else:
+                self.log_line("[!] 无法确认最新版本（%s）—— 已跳过更新检查"
+                              % (info.get("probe_error") or "版本接口不可用"))
             return True
         self.log_line("[!] 游戏本体有新版本 %d（本地 %d）"
                       % (info["live"], info["local"]))
@@ -1215,8 +1224,13 @@ class App(ctk.CTk):
             self.set_status("状态: 检查失败")
             return
         if not info["need_update"]:
-            self.log_line("[+] 游戏本体已是最新（本地 %d）" % info["local"])
-            self.set_status("状态: 已是最新")
+            if info.get("determined"):
+                self.log_line("[+] 游戏本体已是最新（本地 %d）" % info["local"])
+                self.set_status("状态: 已是最新")
+            else:
+                self.log_line("[!] 无法确认最新版本（%s）"
+                              % (info.get("probe_error") or "版本接口不可用"))
+                self.set_status("状态: 无法确认版本")
             return
         self.log_line("[!] 发现新版本 %d（本地 %d）" % (info["live"], info["local"]))
         if self._ask_update(info["live"], info["local"]):
@@ -1234,7 +1248,9 @@ class App(ctk.CTk):
         self.log_line("[%s] %s" % ("+" if r.ok else "!", r.message))
         if not r.ok and self._ui_sync(lambda: self._confirm(
                 "完整性校验未通过",
-                "%s\n\n是否按官方清单重新下载并修复这些文件？" % r.message)):
+                "%s\n\n是否按官方清单补回这些文件？\n"
+                "（只补「缺失」与「损坏」的；与官方不同但大小一致的文件"
+                "通常是你的补丁/汉化，不会动）" % r.message)):
             self._do_update(upd, force=True)     # 版本可能已是最新，必须 force 才会比对修复
             return
         self.set_status("状态: 校验完成" if r.ok else "状态: 校验发现异常")
