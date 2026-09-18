@@ -1191,6 +1191,8 @@ class App(ctk.CTk):
         if not cl.INSTALL_ROOT or not os.path.isdir(cl.INSTALL_ROOT):
             self.log_line("[!] 未配置游戏目录，跳过更新检查")
             return True
+        # 资源层（cznlive）由游戏引擎自己在运行时更新，这里只报本地概况，不联网
+        upd.log_gamedata_local(cl.INSTALL_ROOT, self.log_line)
         self.set_status("状态: 检查游戏本体版本…")
         info = upd.check(on_event=self.log_line)
         if info.get("error"):
@@ -1219,6 +1221,8 @@ class App(ctk.CTk):
             return
         self.set_status("状态: 检查游戏本体版本…")
         info = upd.check(on_event=self.log_line)
+        self.log_line("[*] ---- 游戏资源层（cznlive，由游戏引擎自己更新）----")
+        upd.check_gamedata(cl.INSTALL_ROOT, on_event=self.log_line)
         if info.get("error"):
             self.log_line("[x] %s" % info["error"])
             self.set_status("状态: 检查失败")
@@ -1246,6 +1250,8 @@ class App(ctk.CTk):
         self.set_status("状态: 校验游戏本体完整性…")
         r = upd.verify(on_event=self.log_line, cancel=self._cancel.is_set)
         self.log_line("[%s] %s" % ("+" if r.ok else "!", r.message))
+        self.log_line("[*] ---- 游戏资源层（cznlive，只读识别）----")
+        upd.log_gamedata_local(cl.INSTALL_ROOT, self.log_line)
         if not r.ok and self._ui_sync(lambda: self._confirm(
                 "完整性校验未通过",
                 "%s\n\n是否按官方清单补回这些文件？\n"

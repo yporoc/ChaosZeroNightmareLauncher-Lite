@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -812,6 +813,158 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 
 
 # ====================================================================
+# 游戏资源层（SSRA / cznlive）—— 识别与检测，不下载
+# --------------------------------------------------------------------
+# 游戏由两部分组成，更新通道**完全独立**：
+#   ① 本体 DPMS   <game>\bin\*.dll|*.exe          20 个受管文件  269 MB
+#                 由官方 STOVE 启动器（InstallLib）负责 → 本模块负责
+#   ② 资源 SSRA   <game>\bin\appdata\cznlive\     ~19.4 GB（占整个游戏的 98%）
+#                 由**游戏引擎自己在运行时**按 SSRA 协议更新
+#
+# 资源层由开发商服务器（supercreative.kr）分发：TLS + X-App-Id/X-App-NS 头，
+# 256MB 分块、按语言分区（partion.json）、支持 hdiff 差分与 Range 续传。
+# 本地账本是 data.indices/pcrevs/_<组>_<修订>_<哈希>.pcrevsz（组 = res / text_ko /
+# text_zht / bin_x86_64 …）。
+#
+# 本模块对资源层**只做识别、检测、如实报告，绝不下载或替换**：
+#   · 19.4 GB，写坏代价极高
+#   · data.pack 是加密的、*.pigz 是 PLPcK、pcrevs 是二进制 —— 都是游戏私有格式
+#   · 官方启动器同样不碰它；游戏引擎自己会更新，第三方介入没有收益只有风险
+# ====================================================================
+GAMEDATA_REL = os.path.join("bin", "appdata", "cznlive")
+GAMERES_CONTEXT_NAME = "game-resource-pack-context.json"
+# 游戏本体里硬编码的开发服地址（实机取证）；生产地址由 archive.ssra.context_base_url
+# 等配置在运行时注入，无法从二进制静态确定 —— 故留作可配置项。
+GAMERES_DEFAULT_URL = "https://devpatch11.supercreative.kr:3043/pack/stove"
+_PCREV_RE = re.compile(r"^_(?P<group>.+)_(?P<rev>\d+)_(?P<digest>[0-9a-fA-F]{16,})\.pcrevsz$")
+_PACK_RE = re.compile(r"^data\.pack(~\d+)?$")
+
+
+@dataclass(frozen=True)
+class DataRevision:
+    group: str
+    revision: int
+    digest: str
+
+
+def gamedata_dir(root=None) -> str:
+    return os.path.join(_root(root), GAMEDATA_REL)
+
+
+def read_gamedata_revisions(root=None):
+    """本地各组资源修订号。
+
+    游戏把「每组资源当前修订」写在
+    data.indices/pcrevs/_<组>_<修订>_<哈希>.pcrevsz 的**文件名**里 ——
+    这是它自己维护的账本，读文件名即可，不必去解那个二进制。
+    """
+    d = os.path.join(gamedata_dir(root), "data.indices", "pcrevs")
+    out = []
+    if not os.path.isdir(d):
+        return out
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        m = _PCREV_RE.match(name)
+        if m:
+            out.append(DataRevision(m.group("group"), int(m.group("rev")),
+                                    m.group("digest").lower()))
+    out.sort(key=lambda r: r.group)
+    return out
+
+
+def gamedata_summary(root=None) -> dict:
+    """本地资源层概况（只读，不解包）。"""
+    root = _root(root)
+    d = gamedata_dir(root)
+    info = {"path": d, "exists": os.path.isdir(d), "packs": 0, "pack_bytes": 0,
+            "unpacked_bytes": 0, "revisions": read_gamedata_revisions(root)}
+    if not info["exists"]:
+        return info
+    try:
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if _PACK_RE.match(name) and os.path.isfile(p):
+                info["packs"] += 1
+                info["pack_bytes"] += os.path.getsize(p)
+    except OSError:
+        pass
+    up = os.path.join(d, "data.unpacked")
+    if os.path.isdir(up):
+        total = 0
+        for base, _dirs, files in os.walk(up):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(base, f))
+                except OSError:
+                    pass
+        info["unpacked_bytes"] = total
+    return info
+
+
+def log_gamedata_local(root=None, on_event=None) -> dict:
+    """只报本地资源层概况（不联网，用于每次启动时的一句摘要）。"""
+    log = on_event or (lambda m: None)
+    s = gamedata_summary(root)
+    if not s["exists"]:
+        log("[资源] 未找到 %s" % s["path"])
+        return s
+    log("[资源] 数据包 %d 个 %.2f GB + 已展开 %.2f GB；本地修订 %s"
+        % (s["packs"], s["pack_bytes"] / 1073741824, s["unpacked_bytes"] / 1073741824,
+           "，".join("%s=%d" % (r.group, r.revision) for r in s["revisions"]) or "无"))
+    return s
+
+
+def check_gamedata(root=None, session=None, on_event=None, url=None):
+    """识别并检测资源层。只读；**不下载、不替换**。"""
+    log = on_event or (lambda m: None)
+    root = _root(root)
+    s = log_gamedata_local(root, log)
+    if not s["exists"]:
+        return Result(False, "未找到资源目录：%s" % s["path"])
+
+    base = (url or _u_str("gameres_context_url", GAMERES_DEFAULT_URL)).rstrip("/")
+    cu = base + "/" + GAMERES_CONTEXT_NAME
+    remote = None
+    # 先带证书校验；该服务器证书不被公共 CA 信任（游戏本身也如此），失败再按同样方式重试。
+    # 这里读到的只是「版本号」用于展示，不据此下载任何东西，故风险可接受。
+    for verify in (True, False):
+        try:
+            r = _session(session).get(cu, timeout=20, **({} if verify else {"verify": False}))
+            if getattr(r, "status_code", 0) != 200:
+                raise _HttpError(r.status_code, cu)
+            remote = json.loads(r.content.decode("utf-8-sig"))
+            if not verify:
+                log("[资源] 该服务器证书不被公共 CA 信任，已按游戏同样方式跳过校验"
+                    "（仅用于读取版本号）")
+            break
+        except Exception as exc:
+            if verify:
+                log("[资源] 带证书校验读取失败（%s），改用不校验重试" % str(exc)[:70])
+                continue
+            log("[资源] 远端上下文不可用（%s）：%s" % (base, str(exc)[:100]))
+    if remote is None:
+        log("[资源] 资源层由游戏引擎在运行时自更新，这里只做识别与报告，不影响启动")
+        return Result(True, "资源层：本地 %d 组修订（远端上下文不可用）"
+                      % len(s["revisions"]))
+
+    rev = remote.get("latest_revision")
+    log("[资源] 远端 latest_revision=%s  generated_at=%s  修订数=%s"
+        % (rev, remote.get("generated_at"), remote.get("revision_count")))
+    for item in (remote.get("revisions") or [])[:4]:
+        log("[资源]   rev=%s dir=%s branch=%s mode=%s hdiff=%s"
+            % (item.get("revision"), item.get("revision_dir"),
+               item.get("branch"), item.get("build_mode"),
+               item.get("hdiff_target_count")))
+    log("[资源] 注意：远端用「pack 修订号」、本地用「各组资源修订号」，两套编号不可直接比较；"
+        "精确比对需解析 manifest.ssra（约 6 MB / 8 万条），本模块不做。")
+    return Result(True, "资源层：本地 %d 组修订；远端 pack 修订 %s"
+                  % (len(s["revisions"]), rev))
+
+
+# ====================================================================
 # 编排
 # ====================================================================
 def check(root=None, session=None, on_event=None, allow_probe=None):
@@ -1045,6 +1198,8 @@ def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="CZN 游戏本体更新（DPMS）")
     ap.add_argument("--check", action="store_true", help="只检查版本，不做改动")
+    ap.add_argument("--gamedata", action="store_true",
+                    help="只识别/检测游戏资源层（cznlive，只读不下载）")
     ap.add_argument("--verify", action="store_true", help="全量完整性校验（只读）")
     ap.add_argument("--update", action="store_true", help="检查并执行更新")
     ap.add_argument("--repair", action="store_true", help="按当前清单做一次全量比对修复")
@@ -1059,7 +1214,9 @@ def main(argv=None):
 
     root = _root(a.root)
     print("[*] 安装目录：%s" % (root or "(未配置)"))
-    if a.verify:
+    if a.gamedata:
+        r = check_gamedata(root, on_event=print)
+    elif a.verify:
         r = verify(root, on_event=print)
     elif a.update or a.repair:
         r = update(root, on_event=print, workers=a.workers,
@@ -1072,6 +1229,9 @@ def main(argv=None):
         r = Result(True, "本地 %d → 最新 %d%s"
                    % (info["local"], info["live"],
                       "（需更新）" if info["need_update"] else "（已最新）"))
+        print()
+        print("---- 游戏资源层（cznlive）----")
+        check_gamedata(root, on_event=print)
     print("[%s] %s" % ("+" if r.ok else "x", r.message))
     for e, why in r.failed:
         print("    - %s：%s" % (e.rel, why))
@@ -1146,6 +1306,28 @@ def _selftest_env(tmp):
                         hashlib.md5(gz_good).hexdigest())]}
     with open(os.path.join(cdn, "bad.json"), "w", encoding="utf-8") as f:
         json.dump(bad, f)
+
+    # 资源层（cznlive）：造一份最小结构，验证「只识别、不触碰」
+    cz = os.path.join(root, "bin", "appdata", "cznlive")
+    os.makedirs(os.path.join(cz, "data.indices", "pcrevs"), exist_ok=True)
+    os.makedirs(os.path.join(cz, "data.unpacked", "sound"), exist_ok=True)
+    with open(os.path.join(cz, "data.pack"), "wb") as f:
+        f.write(b"P" * 1024)
+    with open(os.path.join(cz, "data.pack~1"), "wb") as f:
+        f.write(b"P" * 512)
+    with open(os.path.join(cz, "data.unpacked", "sound", "a.bank"), "wb") as f:
+        f.write(b"B" * 256)
+    for nm in ("_res_688_646441ae6a3df78e65f424a1de67f116.pcrevsz",
+               "_text_ko_685_0b08e5bc9f16abb1f8c25343ad8e6b41.pcrevsz",
+               "_bin_x86_64_688_4821b5d4dc63483a1a93b12c053c0b03.pcrevsz"):
+        with open(os.path.join(cz, "data.indices", "pcrevs", nm), "wb") as f:
+            f.write(gzip.compress(b"spdi" + b"\x00" * 52))
+    with open(os.path.join(cdn, GAMERES_CONTEXT_NAME), "w", encoding="utf-8") as f:
+        json.dump({"kind": "game-resource-pack-context", "latest_revision": 42,
+                   "revision_count": 3, "generated_at": "2026-09-18T00:00:00+09:00",
+                   "revisions": [{"revision": 42, "revision_dir": "42-abc",
+                                  "branch": "target/stove/2609",
+                                  "build_mode": "full", "hdiff_target_count": 1}]}, f)
 
     os.makedirs(os.path.join(root, MANIFEST_DIR), exist_ok=True)
     with open(upf_path(root), "w", encoding="utf-8") as f:
@@ -1405,10 +1587,46 @@ def selftest():
             update(root, manifest_url=used, force=True, on_event=lambda m: None)
             chk("默认清理临时目录", not os.path.exists(temp_dir(root)))
 
-            # ㉒ 配置项必须真的被读到（防止「声明了没接上」）
+            # ㉓ 资源层识别：本地修订号从 pcrevs 文件名读出
+            revs = read_gamedata_revisions(root)
+            chk("资源层-本地修订",
+                [(r.group, r.revision) for r in revs]
+                == [("bin_x86_64", 688), ("res", 688), ("text_ko", 685)],
+                [("%s=%d" % (r.group, r.revision)) for r in revs])
+            s = gamedata_summary(root)
+            chk("资源层-体量", s["exists"] and s["packs"] == 2
+                and s["pack_bytes"] == 1536 and s["unpacked_bytes"] == 256,
+                "packs=%d/%dB unpacked=%dB" % (s["packs"], s["pack_bytes"],
+                                               s["unpacked_bytes"]))
+
+            # ㉔ 资源层-远端上下文能取到 → 报告 pack 修订号
+            rg = check_gamedata(root, url=base, on_event=lambda m: None)
+            chk("资源层-远端上下文", rg.ok and "42" in rg.message, rg.message)
+
+            # ㉕ 远端不可用必须如实说，不能假装成功
+            rg2 = check_gamedata(root, url=base + "/not-exist", on_event=lambda m: None)
+            chk("资源层-远端失败如实报告", rg2.ok and "不可用" in rg2.message, rg2.message)
+
+            # ㉖ 更新流程绝不触碰资源层（只读保证）
+            def snap_appdata():
+                out = {}
+                for b, _d, fs in os.walk(os.path.join(root, "bin", "appdata")):
+                    for f in fs:
+                        p = os.path.join(b, f)
+                        out[p] = (os.path.getsize(p), os.path.getmtime(p))
+                return out
+            before_app = snap_appdata()
+            with open(os.path.join(root, "bin", "a.dll"), "wb") as f:
+                f.write(b"x")
+            update(root, manifest_url=used, force=True, on_event=lambda m: None)
+            chk("更新不触碰资源层", before_app == snap_appdata(),
+                "%d 个资源文件" % len(before_app))
+
+            # ㉗ 配置项必须真的被读到（防止「声明了没接上」）
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
                     "resume", "backup_before_replace", "restore_modified",
-                    "keep_temp", "probe_fallback", "check_vcredist")
+                    "keep_temp", "probe_fallback", "check_vcredist",
+                    "gameres_context_url")
             wired = [k for k in keys if _u_bool(k, None) is not None
                      or _u_str(k, "") != "" or _u_int(k, -1) != -1]
             chk("配置段可读", len(wired) == len(keys), "%d/%d" % (len(wired), len(keys)))
