@@ -317,24 +317,38 @@ def write_cache(root: str, entries):
         con.close()
 
 
-def local_version(root=None):
+def _registry_version():
+    """机器级注册表版本（HKCU\\SOFTWARE\\SGUP\\apps\\<GAME_ID>\\Version）。
+
+    ⚠ 这是「这台机器装过官方游戏」的全局记录，不是某个目录的本地版本 ——
+    全新安装到另一个目录时它只配当**探测锚点**（帮我们定位 CDN 上的当前
+    版本号），绝不能当成新目录的 local_version（09-19 用户实测踩坑：
+    注册表 54 泄漏进空目录，安装流程死路）。"""
+    if os.name != "nt":
+        return 0
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"SOFTWARE\SGUP\apps\%s" % cl.GAME_ID) as k:
+            return int(winreg.QueryValueEx(k, "Version")[0])
+    except Exception:
+        return 0
+
+
+def local_version(root=None, include_registry=True):
     """本地版本：注册表与 .upf 双源。
 
     两者不一致时取较小值（保守：宁可多校验一次，也不要漏掉更新）。
+    include_registry=False 用于全新安装：只看目录内 .upf（目录级状态），
+    不把机器级注册表版本算进来。
     返回 (版本, 说明)。
     """
     root = _root(root)
     notes = []
     reg = None
-    if os.name == "nt":
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"SOFTWARE\SGUP\apps\%s" % cl.GAME_ID) as k:
-                reg = int(winreg.QueryValueEx(k, "Version")[0])
-            notes.append("注册表=%d" % reg)
-        except Exception:
-            notes.append("注册表未读到")
+    if os.name == "nt" and include_registry:
+        reg = _registry_version()
+        notes.append("注册表=%d" % reg if reg else "注册表未读到")
     upf = read_upf(root)
     doc = None
     if upf is not None and str(upf.get("local_version", "")).isdigit():
@@ -472,17 +486,25 @@ def _get_bytes(url, session=None, timeout=30):
 
 
 def _probe_status(url, session):
-    """探测单个 URL：返回 'ok' / '404' / 其它情况的说明文本。"""
-    try:
-        _get_bytes(url, session, timeout=15)
-        return "ok"
-    except (_HttpError, urllib.error.HTTPError) as exc:
-        code = int(getattr(exc, "code", 0))
-        if code == 404:
-            return "404"
-        return "HTTP %s（CDN 可能限流或拦截）" % (code or "?")
-    except Exception as exc:
-        return "探测失败：%s" % exc
+    """探测单个 URL：返回 'ok' / '404' / 其它情况的说明文本。
+
+    403/5xx 等瞬态错误重试 2 次 —— 实测同一 URL（v55）一分钟内会出现
+    403→404 漂移（2026-09-19 用户日志），单次采样会把瞬态 403 当成定论。"""
+    last = ""
+    for attempt in (1, 2, 3):
+        try:
+            _get_bytes(url, session, timeout=15)
+            return "ok"
+        except (_HttpError, urllib.error.HTTPError) as exc:
+            code = int(getattr(exc, "code", 0))
+            if code == 404:
+                return "404"
+            last = "HTTP %s（CDN 可能限流或拦截）" % (code or "?")
+        except Exception as exc:
+            last = "探测失败：%s" % exc
+        if attempt < 3:
+            time.sleep(1.0 * attempt)
+    return last
 
 
 def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_AHEAD,
@@ -1203,9 +1225,14 @@ def _probe_templates(url):
             base + "/" + code + "_%d.json"]
 
 
-def check(root=None, session=None, on_event=None, allow_probe=None):
+def check(root=None, session=None, on_event=None, allow_probe=None,
+          token=None, ignore_registry=False):
     """只读：判断本地版本与最新版本。
 
+    token          游戏级令牌（384 字符）——带上走 DPMS API 是权威路径
+                   （方案 v2 §3.1；09-19 实测无 token 恒 401）。
+    ignore_registry=True 用于全新安装：本地版本只看目录内 .upf（应为 0），
+                   机器级注册表版本降级为「探测锚点」。
     返回 dict：{local, live, need_update, manifest_url, probe_url, note}
     """
     log = on_event or (lambda m: None)
@@ -1215,7 +1242,9 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
     if not root or not os.path.isdir(root):
         return {"error": "install_root 未配置或不存在", "local": 0, "live": 0}
 
-    ver, note = local_version(root)
+    ver, note = local_version(root, include_registry=not ignore_registry)
+    if ignore_registry:
+        note += "（全新安装：忽略机器级注册表）"
     log("[更新] 本地版本 %d（%s）" % (ver, note))
 
     upf = read_upf(root) or {}
@@ -1227,7 +1256,12 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
     try:
         api = ("%s/dpms/game/v3.1/live_version?game_id=%s&local_version=%d&pc_room=false"
                % (cl.API, cl.GAME_ID, ver))
-        data = json.loads(_get_bytes(api, session, timeout=20).decode("utf-8"))
+        headers = {"Authorization": "bearer " + token} if token else None
+        s = _session(session)
+        r = s.get(api, headers=headers, timeout=20)
+        if getattr(r, "status_code", 0) != 200:
+            raise _HttpError(r.status_code, api)
+        data = json.loads(r.content.decode("utf-8"))
         val = data.get("value") or {}
         live = int(val.get("live_version") or 0)
         url = str(val.get("live_project_file_url") or url)
@@ -1237,21 +1271,33 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
     except Exception as exc:
         log("[更新] 版本接口不可用（%s）" % exc)
         if allow_probe and probe_tpls:
-            probed, perr = probe_latest_version(probe_tpls, ver + 1, session,
-                                                sanity_version=ver)
-            if perr:
-                probe_error = perr
-                log("[更新] 清单探测不可用：%s" % perr)
+            # 全新安装（ver=0）时没有「当前版本」可作起点：
+            # 用机器级注册表版本做锚点（只当锚点，不当本地版本）；
+            # 连锚点都没有 → 探测无法定界，如实报错让用户先登录。
+            hint = _registry_version() if (ignore_registry and not ver) else 0
+            start = (ver or hint) + 1
+            sanity = ver or hint
+            if not sanity:
+                probe_error = "全新目录且无版本锚点 —— 请先登录后重试（登录后走权威 API）"
+                log("[更新] %s" % probe_error)
             else:
-                # 探测到达 404 边界 = 确定「没有更新的版本」
-                determined = True
-                if probed:
-                    live = probed
-                    url = probe_tpls[1] % probed
-                    source = "清单探测"
-                    log("[更新] 探测到最新版本 %d（%s）" % (live, source))
+                probed, perr = probe_latest_version(probe_tpls, start, session,
+                                                    sanity_version=sanity)
+                if perr:
+                    probe_error = perr
+                    log("[更新] 清单探测不可用：%s" % perr)
                 else:
-                    log("[更新] 探测确认：没有更新的版本")
+                    # 到达 404 边界。probed>0 = 发现了更新版本；
+                    # probed==0 = 「没有更新的版本」—— 但当前版本（sanity）
+                    # 已实测存在，其清单就是安装/修复要用的目标。
+                    determined = True
+                    live = probed or sanity
+                    url = probe_tpls[1] % live
+                    source = "清单探测"
+                    if probed:
+                        log("[更新] 探测到最新版本 %d（%s）" % (live, source))
+                    else:
+                        log("[更新] 探测确认：没有更新的版本（目标版本 %d）" % live)
 
     # 版本旁证：目标版本的 buildInfo.json（非权威，失败不阻断）
     bi_note = ""
@@ -1311,7 +1357,7 @@ def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=Non
 def update(root=None, session=None, on_event=None, cancel=None,
            workers=None, resume=None, backup=None, dry_run=False,
            on_progress=None, force=False, manifest_url=None,
-           restore_modified=None, install=False):
+           restore_modified=None, install=False, token=None):
     """完整流程：检查 → 计划 → 执行。
 
     参数为 None 时从 config.json 的 update 段取默认值。
@@ -1351,10 +1397,11 @@ def update(root=None, session=None, on_event=None, cancel=None,
 
     if manifest_url:
         man_url, source = manifest_url, "指定清单"
-        local_ver = local_version(root)[0]
+        local_ver = local_version(root, include_registry=not install)[0]
         info = {"local": local_ver, "source": source}
     else:
-        info = check(root, session, on_event=log)
+        info = check(root, session, on_event=log, token=token,
+                     ignore_registry=install)
         if info.get("error"):
             return Result(False, info["error"])
         man_url = info.get("manifest_url")
@@ -1943,6 +1990,56 @@ def selftest():
             chk("install 探测模板", len(tpls) == 2
                 and all(cl.GAME_ID in t for t in tpls)
                 and tpls[0].endswith("_%d_v2.json"), tpls[0] if tpls else "-")
+
+            # ㉗c 全新安装版本判定 —— 09-19 用户实测三连 bug 的回归：
+            #   ① 机器级注册表版本不得泄漏进全新目录（应按 0 处理）
+            #   ② 探测「没有更新的版本」后，当前版本的清单必须落地为 manifest_url
+            #   ③ 全新目录以机器注册表版本为探测锚点（仅锚点，非本地版本）
+            class _FakeResp:
+                def __init__(self, code, body):
+                    self.status_code = code
+                    self.content = body
+
+            class _FakeRouteSession:
+                """按 url 子串路由的假会话（离线复现 CDN/API 行为）。"""
+
+                def __init__(self, routes):
+                    self.routes = routes      # {url子串: (status, body)}
+
+                def get(self, url, **kw):
+                    for pref, (code, body) in self.routes.items():
+                        if pref in url:
+                            return _FakeResp(code, body)
+                    return _FakeResp(404, b"{}")
+
+                def head(self, url, **kw):
+                    return _FakeResp(200, {})
+
+            froot = os.path.join(tmp, "checkfresh")
+            os.makedirs(froot, exist_ok=True)
+            fake = _FakeRouteSession({
+                "https://api.onstove.com": (401, b'{"code":40103}'),
+                "STOVE_CHAOSZERO_54_v2.json": (
+                    200, json.dumps({"version_no": 54}).encode()),
+                "STOVE_CHAOSZERO_55": (404, b"Access Denied"),
+                "buildInfo.json": (404, b"x"),
+            })
+            info = check(froot, session=fake, ignore_registry=True)
+            chk("全新安装-忽略注册表泄漏", info["local"] == 0, str(info["local"]))
+            chk("全新安装-锚点探测落地清单",
+                info["determined"] and info["live"] == _registry_version()
+                and info["manifest_url"].endswith("STOVE_CHAOSZERO_54.json"),
+                "live=%s" % info["live"])
+            # 无任何锚点（真·干净机器 + 未登录）→ 如实报错让用户先登录
+            orig_reg = globals()["_registry_version"]
+            globals()["_registry_version"] = lambda: 0
+            try:
+                info2 = check(froot, session=fake, ignore_registry=True)
+                chk("无锚点如实报错", (not info2["determined"])
+                    and "先登录" in info2.get("probe_error", ""),
+                    info2.get("probe_error", "")[:40])
+            finally:
+                globals()["_registry_version"] = orig_reg
 
             # ㉗ 配置项必须真的被读到（防止「声明了没接上」）
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",

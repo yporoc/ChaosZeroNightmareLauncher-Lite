@@ -1192,6 +1192,23 @@ class App(ctk.CTk):
         self.set_status("状态: 更新完成" if r.ok else "状态: 更新失败")
         return r.ok
 
+    def _game_token_quiet(self):
+        """静默拿游戏级令牌（有登录态才续期，没有立即返回 None，不弹任何 UI）。
+        DPMS live_version API 需要它作 Authorization（09-19 实测无 token 恒 401）。"""
+        try:
+            auth = cl.StoveAuth()
+            if not auth.load():
+                return None
+            self.log_line("[*] 使用已保存登录态静默续期…")
+            gt = auth.game_token()
+            if gt:
+                auth.apply_game_token(gt)
+                self._auth = auth
+                return auth.game_access_token
+        except Exception as exc:
+            self.log_line("[!] 静默续期失败（将以清单探测兜底）：%s" % exc)
+        return None
+
     def _maybe_update(self):
         """启动流程里的更新检查。返回 True 表示可以继续启动。"""
         upd = self._upd()
@@ -1203,7 +1220,8 @@ class App(ctk.CTk):
         # 资源层（cznlive）由游戏引擎自己在运行时更新，这里只报本地概况，不联网
         upd.log_gamedata_local(cl.INSTALL_ROOT, self.log_line)
         self.set_status("状态: 检查游戏本体版本…")
-        info = upd.check(on_event=self.log_line)
+        info = upd.check(on_event=self.log_line,
+                         token=getattr(self, "_launch_token", None))
         if info.get("error"):
             self.log_line("[!] %s" % info["error"])
             return True
@@ -1229,7 +1247,7 @@ class App(ctk.CTk):
         if upd is None:
             return
         self.set_status("状态: 检查游戏本体版本…")
-        info = upd.check(on_event=self.log_line)
+        info = upd.check(on_event=self.log_line, token=self._game_token_quiet())
         self.log_line("[*] ---- 游戏资源层（cznlive，由游戏引擎自己更新）----")
         upd.check_gamedata(cl.INSTALL_ROOT, on_event=self.log_line)
         if info.get("error"):
@@ -1336,8 +1354,14 @@ class App(ctk.CTk):
         upd = self._upd()
         if upd is None:
             return
+        # 权威路径：有登录态就静默续期拿 384 令牌走 DPMS API（无 token 恒 401，
+        # 只能靠清单探测；全新目录无锚点时探测无法定界 —— 见 09-19 实测教训）
+        token = self._game_token_quiet()
+        if not token:
+            self.log_line("[!] 未登录 —— 本机也没有官方安装版本可作探测锚点时，"
+                          "全新安装将无法确定目标版本；建议先登录再装")
         r = upd.update(cl.INSTALL_ROOT, on_event=self.log_line,
-                       cancel=self._cancel.is_set, install=True)
+                       cancel=self._cancel.is_set, install=True, token=token)
         self.log_line("[%s] %s" % ("+" if r.ok else "x", r.message))
         for e, why in r.failed:
             self.log_line("    - %s：%s" % (e.rel, why))
@@ -1432,6 +1456,7 @@ class App(ctk.CTk):
         gt = auth.game_token()
         if gt:
             auth.apply_game_token(gt)
+            self._launch_token = auth.game_access_token   # 更新检查的权威 API 鉴权
         else:
             self.log_line("[!] 兑换失败 — 继续, 游戏后端极可能 41002")
         if self._cancel.is_set():
