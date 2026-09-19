@@ -405,6 +405,37 @@ def build_url(manifest_url: str, e: Entry) -> str:
     return "%s/v%s/%s.gz" % (base, e.group, e.seq)
 
 
+def manifest_variants(manifest_url: str) -> list:
+    """同一版本清单的 v1/v2 两种形态，v2 在前（优先）。
+
+    证据（2026-09-18 抓包）：官方启动器现在拉的是
+    `<dir>/<code>_<N>_v2.json?timestamp=…`（16 列），而 .upf 里记录的
+    project_url 仍是 v1 形态 `<dir>/<code>_<N>.json`（13 列）——两种都在线。
+    无法识别命名形态时原样返回。
+    """
+    clean = manifest_url.split("?")[0]
+    base, _, name = clean.rpartition("/")
+    m = re.match(r"^(?P<code>.+)_(?P<ver>\d+)\.json$", name)
+    if not m:
+        return [manifest_url]
+    return ["%s/%s_%s_v2.json" % (base, m.group("code"), m.group("ver")),
+            manifest_url]
+
+
+def fetch_manifest_preferred(url, session=None, timeout=30):
+    """拉清单：优先 _v2 形态（与官方一致），v2 拿不到（403/404）退回 v1。"""
+    variants = manifest_variants(url)
+    last = None
+    for u in variants:
+        try:
+            return fetch_manifest(u, session, timeout)
+        except (_HttpError, urllib.error.HTTPError) as exc:
+            last = exc
+            if int(getattr(exc, "code", 0)) not in (403, 404):
+                raise
+    raise last
+
+
 # ====================================================================
 # HTTP（复用 czn_lite 的网络路由与日志）
 # ====================================================================
@@ -434,25 +465,70 @@ def _get_bytes(url, session=None, timeout=30):
     return r.content
 
 
-def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_AHEAD):
+def _probe_status(url, session):
+    """探测单个 URL：返回 'ok' / '404' / 其它情况的说明文本。"""
+    try:
+        _get_bytes(url, session, timeout=15)
+        return "ok"
+    except (_HttpError, urllib.error.HTTPError) as exc:
+        code = int(getattr(exc, "code", 0))
+        if code == 404:
+            return "404"
+        return "HTTP %s（CDN 可能限流或拦截）" % (code or "?")
+    except Exception as exc:
+        return "探测失败：%s" % exc
+
+
+def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_AHEAD,
+                         sanity_version=0):
     """免鉴权兜底：从 start 起递增探测清单，返回 (最新版本, 错误说明)。
 
-    **只有 404 才代表「该版本不存在」**（到达边界，可正常结束）。
-    其它情况（403 被 CDN 拦、网络异常）都返回错误说明 —— 绝不能悄悄当成
-    「没有更新」，否则 CDN 一限流就会谎报「已是最新」。
+    语义（证据：同一 CDN 对「不存在的版本」昨天回 404、今天回 403 —— 返回码漂移）：
+      · 模板可以是 v1/v2 两种形态的列表，任一形态 200 即视为该版本存在；
+      · 所有形态都 404 才算「到达边界」（确定没有更新的版本）；
+      · 先探测 sanity_version（=本地当前版本）做通道自检：连当前版本的清单
+        都拿不到 ⇒ 探测通道不可信，如实报错 —— 绝不能把 403/网络错误悄悄
+        当成「没有更新」。
     """
+    tpls = list(manifest_url_tpl) if isinstance(manifest_url_tpl, (list, tuple)) \
+        else [manifest_url_tpl]
+    if sanity_version:
+        st = _probe_status(tpls[0] % sanity_version, session)
+        if st != "ok":
+            return 0, "探测通道不可信（当前版本 %d 清单 %s）" % (sanity_version, st)
     best = 0
     for n in range(start, start + limit + 1):
-        try:
-            _get_bytes(manifest_url_tpl % n, session, timeout=15)
+        sts = [_probe_status(t % n, session) for t in tpls]
+        if "ok" in sts:
             best = n
-        except (_HttpError, urllib.error.HTTPError) as exc:
-            if int(getattr(exc, "code", 0)) == 404:
-                return best, ""
-            return best, "HTTP %s（CDN 可能限流或拦截）" % getattr(exc, "code", "?")
-        except Exception as exc:
-            return best, "探测失败：%s" % exc
+            continue
+        if all(s == "404" for s in sts):
+            return best, ""
+        return best, next((s for s in sts if s != "404"), "?")
     return best, ""
+
+
+def buildinfo_url(manifest_url: str, version: int) -> str:
+    """版本旁证对象地址（证据：2026-09-18 抓包，官方对 v54 拉过两次
+    `<dir>/v54/buildInfo.json`，200 返回 PCSDK 配置 JSON）。"""
+    base = manifest_url.split("?")[0].rsplit("/", 1)[0]
+    return "%s/v%d/buildInfo.json" % (base, version)
+
+
+def check_buildinfo(manifest_url, version, session=None, timeout=15):
+    """旁证：目标版本的 buildInfo.json 可取且 game_id 匹配。
+
+    非权威校验（文件校验仍以清单两级 MD5 为准），只用于确认「目标版本对象
+    在 CDN 上完整存在」。失败不阻断 —— 返回 (False, 说明)。
+    """
+    try:
+        data = _get_bytes(buildinfo_url(manifest_url, version), session, timeout)
+        info = json.loads(data.decode("utf-8-sig"))
+        ok = str(info.get("game_id") or "") == cl.GAME_ID
+        note = "buildInfo 旁证通过（pcsdk %s）" % (info.get("pcsdk_version") or "?")
+        return ok, note
+    except Exception as exc:
+        return False, "buildInfo 旁证不可用（%s）" % exc
 
 
 # ====================================================================
@@ -602,6 +678,28 @@ def disk_free(path):
         return None
 
 
+def _etag_ok(url, session, md5_packed):
+    """HEAD 预检：服务端对象的 ETag 是否与清单的压缩包 MD5 一致。
+
+    证据（2026-09-18 抓包）：v54/1.gz 响应头 ETag "cbf3851a…" == 清单第 9 列
+    （md5_packed）—— S3/CloudFront 非 multipart 对象的 ETag 就是内容 MD5。
+    返回 True/False；取不到 ETag 或 HEAD 失败时返回 None（无法判断，照常进行）。
+    价值：断点续传/复用本地缓存前先 5KB 头部确认对象没换，避免对着已更换的
+    CDN 对象续传拼出坏文件、或完整下载后才在 MD5 校验上失败。
+    """
+    try:
+        r = session.head(url, timeout=30)
+        if getattr(r, "status_code", 0) != 200:
+            return None
+        headers = getattr(r, "headers", None) or {}
+        et = headers.get("ETag") or headers.get("etag")
+        if not et or not md5_packed:
+            return None
+        return et.strip('"').lower() == str(md5_packed).lower()
+    except Exception:
+        return None
+
+
 def download_entry(root: str, e: Entry, manifest_url: str, session=None,
                    resume=True, backup=True, on_progress=None):
     """下载 → 两级 MD5 → 解压 → 原子替换。
@@ -621,6 +719,16 @@ def download_entry(root: str, e: Entry, manifest_url: str, session=None,
 
     # ---- 1) 拿压缩包（支持续传）----
     have = os.path.getsize(gz) if os.path.exists(gz) else 0
+    if have and e.md5_packed and resume:
+        # ETag 预检：服务端对象已换（ETag ≠ 清单 md5_packed）⇒ 本地任何断点/
+        # 缓存都作废，直接重下（省得对着坏对象续传，或下载完才在 MD5 上失败）
+        et = _etag_ok(url, s, e.md5_packed)
+        if et is False:
+            try:
+                os.remove(gz)
+            except OSError:
+                pass
+            have = 0
     need_dl = True
     if have and e.packed:
         if have > e.packed:
@@ -821,8 +929,10 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 #   ② 资源 SSRA   <game>\bin\appdata\cznlive\     ~19.4 GB（占整个游戏的 98%）
 #                 由**游戏引擎自己在运行时**按 SSRA 协议更新
 #
-# 资源层由开发商服务器（supercreative.kr）分发：TLS + X-App-Id/X-App-NS 头，
-# 256MB 分块、按语言分区（partion.json）、支持 hdiff 差分与 Range 续传。
+# 资源层分发：生产实测域名 czn-live-down.game.playstove.com（TLS，腾讯 EdgeOne/
+# CloudFront 多 CDN，2026-09-18 抓包）；supercreative.kr 只是 exe 里的开发/默认值。
+# 必需请求头 X-App-Id / X-App-NS，256MB 分块、按语言分区（partion.json）、
+# 支持 hdiff 差分与 Range 续传。
 # 本地账本是 data.indices/pcrevs/_<组>_<修订>_<哈希>.pcrevsz（组 = res / text_ko /
 # text_zht / bin_x86_64 …）。
 #
@@ -833,8 +943,10 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 # ====================================================================
 GAMEDATA_REL = os.path.join("bin", "appdata", "cznlive")
 GAMERES_CONTEXT_NAME = "game-resource-pack-context.json"
-# 游戏本体里硬编码的开发服地址（实机取证）；生产地址由 archive.ssra.context_base_url
-# 等配置在运行时注入，无法从二进制静态确定 —— 故留作可配置项。
+# 游戏本体里硬编码的开发服地址（实机取证）。生产域名实测是
+# czn-live-down.game.playstove.com（2026-09-18 抓包，TLS），但其路径结构与
+# X-App-Id/X-App-NS 的值来自运行时配置注入（exe 零硬编码、REQUIRED_INFO/env
+# 均无），待 MITM 抓包关闭（方案 v2 §7.1）后把生产 URL 固化为默认值。
 GAMERES_DEFAULT_URL = "https://devpatch11.supercreative.kr:3043/pack/stove"
 _PCREV_RE = re.compile(r"^_(?P<group>.+)_(?P<rev>\d+)_(?P<digest>[0-9a-fA-F]{16,})\.pcrevsz$")
 _PACK_RE = re.compile(r"^data\.pack(~\d+)?$")
@@ -984,9 +1096,14 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
 
     upf = read_upf(root) or {}
     url = str(upf.get("project_url") or "")
-    probe_url = None
+    probe_tpls = []
     if url:
-        probe_url = url.rsplit("/", 1)[0] + "/STOVE_CHAOSZERO_%d.json"
+        # 探测模板：v1/v2 两种形态都试（官方已切 v2，但 v1 仍在线）
+        base = url.split("?")[0].rsplit("/", 1)[0]
+        m = re.search(r"/([^/]+?)_\d+(_v2)?\.json$", url.split("?")[0])
+        code = m.group(1) if m else cl.GAME_ID
+        probe_tpls = [base + "/" + code + "_%d_v2.json",
+                      base + "/" + code + "_%d.json"]
 
     live, source, probe_error = 0, "", ""
     determined = False
@@ -1002,8 +1119,9 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
         log("[更新] 服务端最新版本 %d（%s）" % (live, source))
     except Exception as exc:
         log("[更新] 版本接口不可用（%s）" % exc)
-        if allow_probe and probe_url:
-            probed, perr = probe_latest_version(probe_url, ver + 1, session)
+        if allow_probe and probe_tpls:
+            probed, perr = probe_latest_version(probe_tpls, ver + 1, session,
+                                                sanity_version=ver)
             if perr:
                 probe_error = perr
                 log("[更新] 清单探测不可用：%s" % perr)
@@ -1012,16 +1130,22 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
                 determined = True
                 if probed:
                     live = probed
-                    url = probe_url % probed
+                    url = probe_tpls[1] % probed
                     source = "清单探测"
                     log("[更新] 探测到最新版本 %d（%s）" % (live, source))
                 else:
                     log("[更新] 探测确认：没有更新的版本")
 
+    # 版本旁证：目标版本的 buildInfo.json（非权威，失败不阻断）
+    bi_note = ""
+    if determined and live and url and _u_bool("buildinfo_check", True):
+        bi_ok, bi_note = check_buildinfo(url, live, session)
+        log("[更新] %s%s" % ("" if bi_ok else "★ ", bi_note))
+
     return {"local": ver, "live": live, "need_update": bool(live and live > ver),
             "determined": determined, "probe_error": probe_error,
-            "manifest_url": url, "probe_url": probe_url,
-            "note": note, "source": source, "root": root}
+            "manifest_url": url, "probe_url": (probe_tpls[1] if probe_tpls else None),
+            "buildinfo": bi_note, "note": note, "source": source, "root": root}
 
 
 def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=None):
@@ -1035,7 +1159,7 @@ def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=Non
         manifest_url = str(upf.get("project_url") or "")
     if not manifest_url:
         return Result(False, "没有可用的清单地址（先「获取离线信息」）")
-    man, used = fetch_manifest(manifest_url, session)
+    man, used = fetch_manifest_preferred(manifest_url, session)
     log("[校验] 清单 %s（版本 %d，%d 条）" % (used.split("?")[0], man.version, len(man.entries)))
     ok, bad = verify_all(root, man, on_event=log, cancel=cancel)
     total = len(man.files)
@@ -1126,7 +1250,7 @@ def update(root=None, session=None, on_event=None, cancel=None,
         log("[更新] verify_mode=%r 无效，按 full 处理" % mode)
         mode = "full"
 
-    man, used = fetch_manifest(man_url, session)
+    man, used = fetch_manifest_preferred(man_url, session)
     upgraded = bool(man.version and local_ver and man.version != local_ver)
     log("[更新] 目标版本 %d（%d 条记录，其中受管文件 %d 个）%s"
         % (man.version, len(man.entries), len(man.files),
@@ -1188,6 +1312,13 @@ def update(root=None, session=None, on_event=None, cancel=None,
     # 成功后清掉临时目录（失败则保留，供下次断点续传）
     if res.ok and not _u_bool("keep_temp", False):
         shutil.rmtree(temp_dir(root), ignore_errors=True)
+
+    # 官方行为铁证（2026-09-18 官方日志）：同版本下被改过的主程序也会被
+    # 无条件重下覆盖。凡是我们把游戏主程序换回了官方原版，都如实提醒用户。
+    if res.ok and main_rel and any(
+            e.rel.replace(os.sep, "/") == main_rel for e in plan.downloads):
+        log("[更新] ★ 游戏主程序 %s 已回到官方原版 —— 更新后请重新补丁与汉化"
+            % main_rel)
     return res
 
 
@@ -1226,9 +1357,15 @@ def main(argv=None):
         if info.get("error"):
             print("[x] %s" % info["error"])
             return 1
+        if info["need_update"]:
+            verdict = "（需更新）"
+        elif info.get("determined"):
+            verdict = "（已最新）"
+        else:
+            # 接口与探测都不可用 —— 不能谎报「已最新」（探测结果带 unverified 语义）
+            verdict = "（无法确认，%s）" % (info.get("probe_error") or "版本接口不可用")
         r = Result(True, "本地 %d → 最新 %d%s"
-                   % (info["local"], info["live"],
-                      "（需更新）" if info["need_update"] else "（已最新）"))
+                   % (info["local"], info["live"], verdict))
         print()
         print("---- 游戏资源层（cznlive）----")
         check_gamedata(root, on_event=print)
@@ -1251,6 +1388,11 @@ def _selftest_env(tmp):
     cdn = os.path.join(tmp, "cdn")
     os.makedirs(os.path.join(root, "bin"), exist_ok=True)
     os.makedirs(os.path.join(cdn, "v7"), exist_ok=True)
+
+    # buildInfo.json（版本旁证对象，抓包实测 v54 有同名文件）
+    with open(os.path.join(cdn, "v7", "buildInfo.json"), "w", encoding="utf-8") as f:
+        json.dump({"game_id": cl.GAME_ID, "pcsdk_type": 3,
+                   "pcsdk_version": "9.9.9"}, f)
 
     def pack(name, data):
         """把内容压成 gz 放进 CDN，返回 (orig_size, packed_size, md5, md5_packed)。"""
@@ -1292,6 +1434,11 @@ def _selftest_env(tmp):
         json.dump(man, f)
     with open(man_path.replace("manifest", "manifest_v2"), "w", encoding="utf-8") as f:
         json.dump(man, f)                                   # v2：同样内容，验证兼容
+    # 真实 DPMS 命名形态（<code>_<版本>.json / _v2.json），验证 v2 优先逻辑
+    with open(os.path.join(cdn, "STOVE_CHAOSZERO_7.json"), "w", encoding="utf-8") as f:
+        json.dump(man, f)
+    with open(os.path.join(cdn, "STOVE_CHAOSZERO_7_v2.json"), "w", encoding="utf-8") as f:
+        json.dump(man, f)
 
     # 另一份清单：声明的大小/哈希与实际投递的字节不符（模拟服务端内容被篡改）
     D = b"delta" * 50
@@ -1359,7 +1506,7 @@ def _selftest_env(tmp):
                    "install_path": root, "files": [], "locale": "kr",
                    "type_code": 1, "grades": [],
                    "project_url": base + "/manifest.json"}, f)
-    return root, httpd, base
+    return root, httpd, base, cdn
 
 
 def selftest():
@@ -1377,7 +1524,7 @@ def selftest():
     print("=" * 64)
 
     with tempfile.TemporaryDirectory() as tmp:
-        root, httpd, base = _selftest_env(tmp)
+        root, httpd, base, cdn = _selftest_env(tmp)
         try:
             # ① 清单解析
             man, used = fetch_manifest(base + "/manifest.json")
@@ -1626,10 +1773,95 @@ def selftest():
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
                     "resume", "backup_before_replace", "restore_modified",
                     "keep_temp", "probe_fallback", "check_vcredist",
-                    "gameres_context_url")
+                    "buildinfo_check", "gameres_context_url")
             wired = [k for k in keys if _u_bool(k, None) is not None
                      or _u_str(k, "") != "" or _u_int(k, -1) != -1]
             chk("配置段可读", len(wired) == len(keys), "%d/%d" % (len(wired), len(keys)))
+
+            # ㉘ v2 清单优先：同一版本优先取 <code>_<N>_v2.json（官方 2026-09 起的形态）
+            man2, used2 = fetch_manifest_preferred(
+                base + "/STOVE_CHAOSZERO_7.json")
+            chk("清单 v2 优先", used2.split("?")[0].endswith("STOVE_CHAOSZERO_7_v2.json")
+                and man2.version == 7, used2.rsplit("/", 1)[-1])
+            chk("v2 命名推导",
+                manifest_variants("http://x/game/dpms_CODE_54.json")[0]
+                == "http://x/game/dpms_CODE_54_v2.json",
+                str(manifest_variants("http://x/game/dpms_CODE_54.json")))
+
+            # ㉙ 探测通道自检：连「当前版本」都拿不到 ⇒ 通道不可信，如实报错
+            probed3, perr3 = probe_latest_version([base + "/blocked_%d.json"], 3,
+                                                  sanity_version=1)
+            chk("探测：当前版本 403 ⇒ 通道不可信",
+                probed3 == 0 and "不可信" in perr3, repr(perr3))
+
+            # ㉚ ETag 预检：服务端对象与清单不符 ⇒ 丢弃本地缓存重下；相符 ⇒ 直接用缓存
+            class _FakeResp:
+                def __init__(self, code, headers):
+                    self.status_code = code
+                    self.headers = headers
+
+            class _FakeSession:
+                """head 返回固定 ETag；get 透传到真会话并计数。"""
+
+                def __init__(self, etag, real):
+                    self.etag = etag
+                    self.real = real
+                    self.heads = 0
+                    self.gets = 0
+
+                def head(self, url, timeout=30):
+                    self.heads += 1
+                    h = {} if self.etag is None else {"ETag": self.etag}
+                    return _FakeResp(200, h)
+
+                def get(self, *a, **k):
+                    self.gets += 1
+                    return self.real.get(*a, **k)
+
+            e_b = [x for x in man2.files if x.rel.endswith("b.dll")][0]
+            real_s = _session(None)
+            with open(os.path.join(root, "bin", "b.dll"), "wb") as f:
+                f.write(b"x")                                   # 弄坏目标文件
+            gz_b = os.path.join(temp_dir(root), "%s_%s.gz" % (e_b.group, e_b.seq))
+            os.makedirs(temp_dir(root), exist_ok=True)
+            with open(os.path.join(cdn, "v7", "2.gz"), "rb") as f:
+                good_gz = f.read()                              # 正确的完整包
+            with open(gz_b, "wb") as f:
+                f.write(good_gz)                                # 本地已有完整正确缓存
+            fs_ok = _FakeSession(e_b.md5_packed, real_s)
+            download_entry(root, e_b, used2, session=fs_ok)
+            chk("ETag 相符 ⇒ 复用缓存不重下", fs_ok.heads == 1 and fs_ok.gets == 0,
+                "heads=%d gets=%d" % (fs_ok.heads, fs_ok.gets))
+            with open(os.path.join(root, "bin", "b.dll"), "wb") as f:
+                f.write(b"x")
+            fs_bad = _FakeSession("deadbeef" * 4, real_s)
+            download_entry(root, e_b, used2, session=fs_bad)
+            chk("ETag 不符 ⇒ 丢弃缓存重下", fs_bad.heads == 1 and fs_bad.gets == 1
+                and md5_file(os.path.join(root, "bin", "b.dll")) == e_b.md5,
+                "heads=%d gets=%d" % (fs_bad.heads, fs_bad.gets))
+            fs_none = _FakeSession(None, real_s)                # 无 ETag ⇒ 照常
+            with open(os.path.join(root, "bin", "b.dll"), "wb") as f:
+                f.write(b"x")
+            os.remove(gz_b)
+            download_entry(root, e_b, used2, session=fs_none)
+            chk("无 ETag ⇒ 照常下载", fs_none.gets == 1
+                and md5_file(os.path.join(root, "bin", "b.dll")) == e_b.md5)
+
+            # ㉛ buildInfo 旁证
+            bi_ok, bi_note = check_buildinfo(used2, 7)
+            chk("buildInfo 旁证通过", bi_ok, bi_note)
+            bi_ok2, bi_note2 = check_buildinfo(used2, 8)
+            chk("buildInfo 缺失如实报", (not bi_ok2) and "不可用" in bi_note2, bi_note2)
+
+            # ㉜ 主程序被换回官方原版 ⇒ 明确提示重新补丁/汉化
+            with open(os.path.join(root, "bin", "a.dll"), "wb") as f:
+                f.write(b"x")                                   # 主程序 a.dll 被改坏
+            msgs = []
+            rh = update(root, manifest_url=used2, force=True, on_event=msgs.append)
+            chk("主程序替换提示", rh.ok
+                and any("重新补丁与汉化" in m for m in msgs)
+                and any("已回到官方原版" in m for m in msgs),
+                "日志 %d 条" % len(msgs))
         finally:
             httpd.shutdown()
 

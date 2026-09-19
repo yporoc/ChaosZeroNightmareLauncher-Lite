@@ -66,6 +66,7 @@
   "keep_temp": false,
   "probe_fallback": true,
   "check_vcredist": true,
+  "buildinfo_check": true,
   "gameres_context_url": "https://devpatch11.supercreative.kr:3043/pack/stove"
  }
 }
