@@ -67,6 +67,11 @@
   "probe_fallback": true,
   "check_vcredist": true,
   "buildinfo_check": true,
-  "gameres_context_url": "https://devpatch11.supercreative.kr:3043/pack/stove"
+  "gameres_entry_url": "https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive",
+  "gameres_appid": "cznlive",
+  "gameres_ns": "ssr-base-260909",
+  "gameres_build": 464,
+  "gameres_world": "asia",
+  "gameres_branch": "live"
  }
 }

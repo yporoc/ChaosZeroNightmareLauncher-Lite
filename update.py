@@ -30,11 +30,14 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -921,33 +924,44 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 
 
 # ====================================================================
-# 游戏资源层（SSRA / cznlive）—— 识别与检测，不下载
+# 游戏资源层（SSRA / cznlive）—— 识别、检测、报告；不下载、不替换
 # --------------------------------------------------------------------
 # 游戏由两部分组成，更新通道**完全独立**：
 #   ① 本体 DPMS   <game>\bin\*.dll|*.exe          20 个受管文件  269 MB
 #                 由官方 STOVE 启动器（InstallLib）负责 → 本模块负责
 #   ② 资源 SSRA   <game>\bin\appdata\cznlive\     ~19.4 GB（占整个游戏的 98%）
-#                 由**游戏引擎自己在运行时**按 SSRA 协议更新
+#                 由**游戏引擎自己在运行时**更新
 #
-# 资源层分发：生产实测域名 czn-live-down.game.playstove.com（TLS，腾讯 EdgeOne/
-# CloudFront 多 CDN，2026-09-18 抓包）；supercreative.kr 只是 exe 里的开发/默认值。
-# 必需请求头 X-App-Id / X-App-NS，256MB 分块、按语言分区（partion.json）、
-# 支持 hdiff 差分与 Range 续传。
-# 本地账本是 data.indices/pcrevs/_<组>_<修订>_<哈希>.pcrevsz（组 = res / text_ko /
-# text_zht / bin_x86_64 …）。
+# 生产协议（2026-09-19 MITM 抓包 + 重放实测，方案 v2 §7.1 已关闭）：
+#   入口  GET https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive
+#         ?platform=win32&appid=cznlive&build=<N>&lang=..&oslang=..
+#         &package=<market_game_id>&device_uid=..&publisher_uid=&buildx=<hex>
+#         —— 零鉴权；X-App-Id/X-App-NS 可省；build 参数容错；
+#            响应间唯一差异是 _entry_timestamp（nonce）
+#   配置  响应即游戏的世界/版本配置（= 生产 verinfo）：
+#           cdn.url = https://czn-live-down.game.playstove.com/patch/1.0.46407/WLOP8Q5CZ9HW/
+#           cdn.version.policies = "res,media,text"
+#           cdn.version_res/media/text.current = 688 / 227 / 688
+#           cdn.context = "$(remote.res.version)/$(remote.res.version)-$(local.res.version).tar.lz4"
+#           app.api（wss 游戏套接字）、title_movie_cdn、build.version=464
+#   比对  引擎实际比对的「本地组修订号」在 data.indices/<组>.pigz 尾部：
+#           8 字节 `@ver` + u32（实测 res=688 / media=227 / text=688，
+#           与远端逐组一致 ⇒ 无更新；pcrevs 文件名里的 text_ko=685 /
+#           text_zht=687 是语言子层修订，不是组级修订）
 #
 # 本模块对资源层**只做识别、检测、如实报告，绝不下载或替换**：
-#   · 19.4 GB，写坏代价极高
+#   · 19.4 GB，写坏代价极高；增量包（tar.lz4）的落地与校验由游戏引擎完成
 #   · data.pack 是加密的、*.pigz 是 PLPcK、pcrevs 是二进制 —— 都是游戏私有格式
-#   · 官方启动器同样不碰它；游戏引擎自己会更新，第三方介入没有收益只有风险
+#   · 官方启动器同样不碰它；游戏引擎自己会更新
 # ====================================================================
 GAMEDATA_REL = os.path.join("bin", "appdata", "cznlive")
-GAMERES_CONTEXT_NAME = "game-resource-pack-context.json"
-# 游戏本体里硬编码的开发服地址（实机取证）。生产域名实测是
-# czn-live-down.game.playstove.com（2026-09-18 抓包，TLS），但其路径结构与
-# X-App-Id/X-App-NS 的值来自运行时配置注入（exe 零硬编码、REQUIRED_INFO/env
-# 均无），待 MITM 抓包关闭（方案 v2 §7.1）后把生产 URL 固化为默认值。
-GAMERES_DEFAULT_URL = "https://devpatch11.supercreative.kr:3043/pack/stove"
+# 入口 API 与默认参数（均为 2026-09-19 实测值；可在 config.json 覆盖）
+GAMERES_ENTRY_DEFAULT = ("https://live-czn-entry2lx2fz.game.playstove.com"
+                         ":13001/cznlive")
+GAMERES_APPID_DEFAULT = "cznlive"          # exe 内嵌（"cznlive.1.0.464"）
+GAMERES_NS_DEFAULT = "ssr-base-260909"     # 抓包实测 X-App-NS（非必需头）
+GAMERES_BUILD_DEFAULT = 464                # exe 内嵌版本 1.0.464
+GAMERES_INDEX_VER_MARK = b"@ver"           # *.pigz 尾部的组修订记录标记
 _PCREV_RE = re.compile(r"^_(?P<group>.+)_(?P<rev>\d+)_(?P<digest>[0-9a-fA-F]{16,})\.pcrevsz$")
 _PACK_RE = re.compile(r"^data\.pack(~\d+)?$")
 
@@ -1029,51 +1043,139 @@ def log_gamedata_local(root=None, on_event=None) -> dict:
     return s
 
 
-def check_gamedata(root=None, session=None, on_event=None, url=None):
-    """识别并检测资源层。只读；**不下载、不替换**。"""
+def read_index_versions(root=None) -> dict:
+    """各组资源的「本地补丁修订号」—— 引擎实际用来比对的那个数。
+
+    证据（2026-09-19 实测解包）：data.indices/<组>.pigz（gzip 的 PLPcK 索引）
+    末尾 8 字节是 `@ver` + u32 修订号：
+      text.pigz → 688 == 远端 cdn.version_text.current=688
+      media.pigz → 227 == 远端 cdn.version_media.current=227
+      res.pigz  → 688 == 远端 cdn.version_res.current=688
+    （pcrevs 文件名里的 text_ko=685 / text_zht=687 是**语言子层**修订，
+    不是引擎比对的组级修订 —— 组级修订在索引 @ver 里。）
+    """
+    d = os.path.join(gamedata_dir(root), "data.indices")
+    out = {}
+    if not os.path.isdir(d):
+        return out
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".pigz"):
+            continue
+        try:
+            with gzip.open(os.path.join(d, name), "rb") as f:
+                data = f.read()
+        except (OSError, EOFError, gzip.BadGzipFile):
+            continue
+        if len(data) >= 8 and data[-8:-4] == GAMERES_INDEX_VER_MARK:
+            out[name[:-5]] = struct.unpack_from("<I", data, len(data) - 4)[0]
+    return out
+
+
+def fetch_world_config(session=None, on_event=None, entry_url=None) -> dict:
+    """拉游戏的入口/版本配置（生产 verinfo，2026-09-19 抓包 + 重放实测）。
+
+    请求形态（照抄游戏原样，参数服务端不校验）：
+      GET <entry>?platform=win32&appid=<appid>&build=<build>&lang=..&oslang=..
+         &package=<market_game_id>&device_uid=<uuid>&publisher_uid=&buildx=<hex>
+    实测：零鉴权；缺 X-App-Id/X-App-NS 头也 200；build=400 一样返回当前配置。
+    返回 world.<world>.<branch> 节点（cdn.url / cdn.version_*.current /
+    app.api / build.version / title_movie_cdn …）。
+    """
+    log = on_event or (lambda m: None)
+    base = (entry_url or _u_str("gameres_entry_url", GAMERES_ENTRY_DEFAULT)).rstrip("/")
+    appid = _u_str("gameres_appid", GAMERES_APPID_DEFAULT)
+    build = _u_int("gameres_build", GAMERES_BUILD_DEFAULT)
+    world = _u_str("gameres_world", "asia")
+    branch = _u_str("gameres_branch", "live")
+    qs = urllib.parse.urlencode({
+        "platform": "win32", "appid": appid, "build": build,
+        "lang": "zht", "oslang": "zhs",
+        "package": cl.MARKET_GAME_ID, "device_uid": uuid.uuid4().hex,
+        "publisher_uid": "", "buildx": "0" * 64,
+    })
+    url = base + "?" + qs
+    headers = {"X-App-Id": appid,
+               "X-App-NS": _u_str("gameres_ns", GAMERES_NS_DEFAULT)}
+    r = _session(session).get(url, headers=headers, timeout=20)
+    if getattr(r, "status_code", 0) != 200:
+        raise _HttpError(r.status_code, url)
+    data = json.loads(r.content.decode("utf-8-sig"))
+    node = (((data.get("world") or {}).get(world) or {}).get(branch) or {})
+    if not node:
+        raise ValueError("配置缺 world.%s.%s（现有：%s）"
+                         % (world, branch,
+                            list((data.get("world") or {}).keys())))
+    return node
+
+
+def check_gamedata(root=None, session=None, on_event=None, entry_url=None):
+    """识别并检测资源层（只读；**不下载、不替换**）。
+
+    P1（2026-09-19 生产协议取证后）：逐组比对
+      本地  data.indices/<组>.pigz 尾部 @ver 修订号（引擎实际比对的值）
+      远端  入口 API world.<world>.<branch> 的 cdn.version_<组>.current
+      增量  cdn.context 模板 $(remote)/$(remote)-$(local).tar.lz4（cdn.url 下）
+    远端不可达时如实报告，不影响启动；增量包由游戏引擎运行时自取。
+    """
     log = on_event or (lambda m: None)
     root = _root(root)
     s = log_gamedata_local(root, log)
     if not s["exists"]:
         return Result(False, "未找到资源目录：%s" % s["path"])
 
-    base = (url or _u_str("gameres_context_url", GAMERES_DEFAULT_URL)).rstrip("/")
-    cu = base + "/" + GAMERES_CONTEXT_NAME
-    remote = None
-    # 先带证书校验；该服务器证书不被公共 CA 信任（游戏本身也如此），失败再按同样方式重试。
-    # 这里读到的只是「版本号」用于展示，不据此下载任何东西，故风险可接受。
-    for verify in (True, False):
-        try:
-            r = _session(session).get(cu, timeout=20, **({} if verify else {"verify": False}))
-            if getattr(r, "status_code", 0) != 200:
-                raise _HttpError(r.status_code, cu)
-            remote = json.loads(r.content.decode("utf-8-sig"))
-            if not verify:
-                log("[资源] 该服务器证书不被公共 CA 信任，已按游戏同样方式跳过校验"
-                    "（仅用于读取版本号）")
-            break
-        except Exception as exc:
-            if verify:
-                log("[资源] 带证书校验读取失败（%s），改用不校验重试" % str(exc)[:70])
-                continue
-            log("[资源] 远端上下文不可用（%s）：%s" % (base, str(exc)[:100]))
-    if remote is None:
-        log("[资源] 资源层由游戏引擎在运行时自更新，这里只做识别与报告，不影响启动")
-        return Result(True, "资源层：本地 %d 组修订（远端上下文不可用）"
-                      % len(s["revisions"]))
+    local_ver = read_index_versions(root)
+    if local_ver:
+        log("[资源] 本地组修订（索引 @ver）：%s"
+            % "，".join("%s=%d" % kv for kv in sorted(local_ver.items())))
 
-    rev = remote.get("latest_revision")
-    log("[资源] 远端 latest_revision=%s  generated_at=%s  修订数=%s"
-        % (rev, remote.get("generated_at"), remote.get("revision_count")))
-    for item in (remote.get("revisions") or [])[:4]:
-        log("[资源]   rev=%s dir=%s branch=%s mode=%s hdiff=%s"
-            % (item.get("revision"), item.get("revision_dir"),
-               item.get("branch"), item.get("build_mode"),
-               item.get("hdiff_target_count")))
-    log("[资源] 注意：远端用「pack 修订号」、本地用「各组资源修订号」，两套编号不可直接比较；"
-        "精确比对需解析 manifest.ssra（约 6 MB / 8 万条），本模块不做。")
-    return Result(True, "资源层：本地 %d 组修订；远端 pack 修订 %s"
-                  % (len(s["revisions"]), rev))
+    try:
+        node = fetch_world_config(session, log, entry_url=entry_url)
+    except Exception as exc:
+        log("[资源] 入口配置不可达（%s）" % str(exc)[:140])
+        log("[资源] 资源层由游戏引擎在运行时自更新，这里只做识别与报告，不影响启动")
+        return Result(True, "资源层：本地组修订 %s（远端不可达）"
+                      % (dict(sorted(local_ver.items())) or "未知"))
+
+    cdn_url = str(node.get("cdn.url") or "")
+    log("[资源] 远端 build.version=%s  cdn.url=%s"
+        % (node.get("build.version"), cdn_url))
+    policies = [p.strip() for p in
+                str(node.get("cdn.version.policies") or "").split(",") if p.strip()]
+
+    diffs = []
+    for g in policies:
+        remote_v = _int(node.get("cdn.version_%s.current" % g), 0)
+        local_v = local_ver.get(g)
+        if local_v is None:
+            state = "本地未知"
+        elif local_v == remote_v:
+            state = "一致"
+        elif local_v > remote_v:
+            state = "本地较新?"
+        else:
+            state = "可更新"
+        log("[资源]   组 %-5s 本地=%s 远端=%d ⇒ %s"
+            % (g, local_v if local_v is not None else "?", remote_v, state))
+        if local_v is not None and remote_v > local_v:
+            diffs.append((g, local_v, remote_v))
+
+    if not diffs:
+        return Result(True, "资源层：所有组与远端一致（%s）"
+                      % "，".join("%s=%d" % (g, _int(node.get("cdn.version_%s.current" % g)))
+                                  for g in policies))
+
+    parts = []
+    for g, lv, rv in diffs:
+        # cdn.context 模板原文：$(remote)/$(remote)-$(local).tar.lz4（抓包实测）
+        delta = "%s%s/%s-%s.tar.lz4" % (cdn_url, rv, rv, lv)
+        parts.append("%s %d→%d" % (g, lv, rv))
+        log("[资源]   增量包（按 cdn.context 模板推导，游戏运行时自取）：%s" % delta)
+    return Result(True, "资源层：%d 组可更新（%s）—— 游戏启动后会自行下载"
+                  % (len(diffs), "，".join(parts)))
 
 
 # ====================================================================
@@ -1469,12 +1571,11 @@ def _selftest_env(tmp):
                "_bin_x86_64_688_4821b5d4dc63483a1a93b12c053c0b03.pcrevsz"):
         with open(os.path.join(cz, "data.indices", "pcrevs", nm), "wb") as f:
             f.write(gzip.compress(b"spdi" + b"\x00" * 52))
-    with open(os.path.join(cdn, GAMERES_CONTEXT_NAME), "w", encoding="utf-8") as f:
-        json.dump({"kind": "game-resource-pack-context", "latest_revision": 42,
-                   "revision_count": 3, "generated_at": "2026-09-18T00:00:00+09:00",
-                   "revisions": [{"revision": 42, "revision_dir": "42-abc",
-                                  "branch": "target/stove/2609",
-                                  "build_mode": "full", "hdiff_target_count": 1}]}, f)
+    # 各组资源索引（.pigz，末尾 @ver + u32 = 组级修订号 —— 引擎比对的值）
+    for grp, ver in (("res", 688), ("media", 227), ("text", 688)):
+        with open(os.path.join(cz, "data.indices", grp + ".pigz"), "wb") as f:
+            f.write(gzip.compress(b"PLPcK-selftest" + b"\x00" * 24
+                                  + b"@ver" + struct.pack("<I", ver)))
 
     os.makedirs(os.path.join(root, MANIFEST_DIR), exist_ok=True)
     with open(upf_path(root), "w", encoding="utf-8") as f:
@@ -1506,6 +1607,24 @@ def _selftest_env(tmp):
                    "install_path": root, "files": [], "locale": "kr",
                    "type_code": 1, "grades": [],
                    "project_url": base + "/manifest.json"}, f)
+
+    # 生产 verinfo 形态的入口配置（2026-09-19 抓包原文结构）：全一致版 / res 可更新版
+    def world_cfg(res_v, media_v, text_v):
+        return {"_appid": "cznlive", "_entry_timestamp": "0",
+                "world": {"asia": {"live": {
+                    "build.version": "464",
+                    "cdn.url": base + "/cdn/patch/1.0.46407/WLOP8Q5CZ9HW/",
+                    "cdn.version.policies": "res,media,text",
+                    "cdn.version_res.current": res_v,
+                    "cdn.version_media.current": media_v,
+                    "cdn.version_text.current": text_v,
+                    "app.api": "wss://example.test:13701/api/"}}},
+                "extra_world_guard": True}
+
+    with open(os.path.join(cdn, "cznlive"), "w", encoding="utf-8") as f:
+        json.dump(world_cfg(688, 227, 688), f)
+    with open(os.path.join(cdn, "cznlive2"), "w", encoding="utf-8") as f:
+        json.dump(world_cfg(689, 227, 688), f)
     return root, httpd, base, cdn
 
 
@@ -1746,13 +1865,26 @@ def selftest():
                 "packs=%d/%dB unpacked=%dB" % (s["packs"], s["pack_bytes"],
                                                s["unpacked_bytes"]))
 
-            # ㉔ 资源层-远端上下文能取到 → 报告 pack 修订号
-            rg = check_gamedata(root, url=base, on_event=lambda m: None)
-            chk("资源层-远端上下文", rg.ok and "42" in rg.message, rg.message)
+            # ㉔ 资源层检测：入口配置可达 → 逐组比对（全一致）
+            rg = check_gamedata(root, entry_url=base + "/cznlive",
+                                on_event=lambda m: None)
+            chk("资源层-逐组一致", rg.ok and "一致" in rg.message, rg.message)
 
-            # ㉕ 远端不可用必须如实说，不能假装成功
-            rg2 = check_gamedata(root, url=base + "/not-exist", on_event=lambda m: None)
-            chk("资源层-远端失败如实报告", rg2.ok and "不可用" in rg2.message, rg2.message)
+            # ㉕ 资源层检测：远端有新修订 → 报可更新 + 按 cdn.context 模板给增量 URL
+            logs5 = []
+            rg2 = check_gamedata(root, entry_url=base + "/cznlive2",
+                                 on_event=logs5.append)
+            chk("资源层-检测到可更新", rg2.ok and "可更新" in rg2.message
+                and "res 688→689" in rg2.message, rg2.message)
+            chk("资源层-增量 URL 模板",
+                any("689/689-688.tar.lz4" in m for m in logs5),
+                [m for m in logs5 if "tar.lz4" in m][:1])
+
+            # ㉕b 远端不可达必须如实说，不能假装成功
+            rg3 = check_gamedata(root, entry_url=base + "/not-exist",
+                                 on_event=lambda m: None)
+            chk("资源层-远端失败如实报告", rg3.ok and "不可达" in rg3.message,
+                rg3.message)
 
             # ㉖ 更新流程绝不触碰资源层（只读保证）
             def snap_appdata():
@@ -1773,7 +1905,9 @@ def selftest():
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
                     "resume", "backup_before_replace", "restore_modified",
                     "keep_temp", "probe_fallback", "check_vcredist",
-                    "buildinfo_check", "gameres_context_url")
+                    "buildinfo_check", "gameres_entry_url", "gameres_appid",
+                    "gameres_ns", "gameres_build", "gameres_world",
+                    "gameres_branch")
             wired = [k for k in keys if _u_bool(k, None) is not None
                      or _u_str(k, "") != "" or _u_int(k, -1) != -1]
             chk("配置段可读", len(wired) == len(keys), "%d/%d" % (len(wired), len(keys)))

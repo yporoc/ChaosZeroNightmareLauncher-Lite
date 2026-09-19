@@ -122,14 +122,20 @@ STOVE 的账密登录在服务端会要求**交互式人机验证码**（点选�
 | 部分 | 位置 | 体积 | 谁更新 | 启动器 |
 |---|---|---|---|---|
 | **本体** | `<游戏目录>\bin\*.dll`、`*.exe`（20 个受管文件） | 269 MB | 官方 STOVE 启动器（DPMS） | **本启动器负责**（检查/校验/增量下载替换） |
-| **资源** | `<游戏目录>\bin\appdata\cznlive\` | **约 19 GB（占 98%）** | **游戏引擎自己在运行时**（SSRA） | **只识别与检测，不下载不替换** |
+| **资源** | `<游戏目录>\bin\appdata\cznlive\` | **约 19 GB（占 98%）** | **游戏引擎自己在运行时**（SSRA） | **逐组检测并报告，不下载不替换** |
 
-资源层由开发商服务器分发（TLS、256 MB 分块、按语言分区、支持差分与续传），
-本地账本是 `data.indices/pcrevs/_<组>_<修订>_<哈希>.pcrevsz`（组如 `res` / `text_ko` / `text_zht` / `bin_x86_64`）。
+资源层生产协议（2026-09-19 对官方会话 MITM 取证 + 重放实测）：
 
-启动器会在日志里报出资源层的**体积与本地各组修订号**，并尝试读取远端上下文
-（`config.json` 的 `update.gameres_context_url`）。**下载与替换仍由游戏完成** ——
-数据包是加密的私有格式、总量 19 GB，第三方介入只有风险没有收益，官方启动器同样不碰。
+- 游戏启动时调**入口 API**（`live-czn-entry2lx2fz.game.playstove.com:13001/cznlive`，
+  零鉴权、参数容错）拿到版本配置：`cdn.url`（`czn-live-down.game.playstove.com/patch/<build>/<token>/`）、
+  各组当前修订 `cdn.version_res/media/text.current`、增量模板
+  `cdn.context = $(remote)/$(remote)-$(local).tar.lz4`；
+- 引擎实际比对的**本地组修订号**在 `data.indices/<组>.pigz` 索引末尾的
+  `@ver` + u32（`pcrevs` 文件名里的 `text_ko=685`/`text_zht=687` 是语言子层修订）；
+- 启动器据此**逐组比对本地 vs 远端**并给出结论（一致 / 可更新 + 增量包 URL），
+  配置项在 `update.gameres_*` 六个键。**下载与替换仍由游戏完成** ——
+  数据包是加密的私有格式、总量 19 GB，增量落地与校验由游戏引擎做，
+  官方启动器同样不碰这一层。
 
 ## 构建
 
