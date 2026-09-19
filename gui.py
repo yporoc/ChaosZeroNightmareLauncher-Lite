@@ -1194,7 +1194,11 @@ class App(ctk.CTk):
 
     def _game_token_quiet(self):
         """静默拿游戏级令牌（有登录态才续期，没有立即返回 None，不弹任何 UI）。
-        DPMS live_version API 需要它作 Authorization（09-19 实测无 token 恒 401）。"""
+        DPMS live_version API 需要它作 Authorization（09-19 实测无 token 恒 401）。
+        10 分钟内复用已换取的令牌，避免一次操作里重复兑换（用户日志实测连兑两次）。"""
+        if (getattr(self, "_launch_token", None)
+                and time.time() - getattr(self, "_token_ts", 0) < 600):
+            return self._launch_token
         try:
             auth = cl.StoveAuth()
             if not auth.load():
@@ -1203,8 +1207,9 @@ class App(ctk.CTk):
             gt = auth.game_token()
             if gt:
                 auth.apply_game_token(gt)
-                self._auth = auth
-                return auth.game_access_token
+                self._launch_token = auth.game_access_token
+                self._token_ts = time.time()
+                return self._launch_token
         except Exception as exc:
             self.log_line("[!] 静默续期失败（将以清单探测兜底）：%s" % exc)
         return None

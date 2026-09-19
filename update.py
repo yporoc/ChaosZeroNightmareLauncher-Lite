@@ -1253,51 +1253,82 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
 
     live, source, probe_error = 0, "", ""
     determined = False
-    try:
+
+    def _dpms_call(local_ver):
+        """调 DPMS live_version，返回 (live, project_file_url)。
+
+        响应结构注记（方案 v2 §3.1 标注 [推断]）：2026-09-19 用户实测证明
+        HTTP 200 + 游戏级令牌被接受，但 value 里没有推断中的 live_version
+        （或 code≠0）——推断结构不成立。本函数因此做三件事：
+          · code≠0 视为 API 错误并携带服务端消息（STOVE 惯例：HTTP 200 + 体内 code）
+          · 200 但取不到 live_version 时**把响应原文打进日志**（一次重测定案）
+          · 由调用方决定是否降级到探测兜底（绝不信任 live=0 的 200）
+        """
         api = ("%s/dpms/game/v3.1/live_version?game_id=%s&local_version=%d&pc_room=false"
-               % (cl.API, cl.GAME_ID, ver))
+               % (cl.API, cl.GAME_ID, local_ver))
         headers = {"Authorization": "bearer " + token} if token else None
-        s = _session(session)
-        r = s.get(api, headers=headers, timeout=20)
+        r = _session(session).get(api, headers=headers, timeout=20)
         if getattr(r, "status_code", 0) != 200:
             raise _HttpError(r.status_code, api)
-        data = json.loads(r.content.decode("utf-8"))
+        body = r.content.decode("utf-8", "replace")
+        try:
+            data = json.loads(body)
+        except Exception:
+            raise ValueError("非 JSON 响应：%s" % body[:160])
+        code = data.get("code")
+        if code not in (None, 0):
+            raise ValueError("code=%s %s" % (code, data.get("message", "")))
         val = data.get("value") or {}
-        live = int(val.get("live_version") or 0)
-        url = str(val.get("live_project_file_url") or url)
-        source = "DPMS API"
-        determined = bool(live)
-        log("[更新] 服务端最新版本 %d（%s）" % (live, source))
+        lv = int(val.get("live_version") or 0)
+        if not lv:
+            log("[更新] DPMS 响应未含 live_version，原文（截断）：%s" % body[:240])
+        return lv, str(val.get("live_project_file_url") or "")
+
+    try:
+        live, api_url = _dpms_call(ver)
+        if not live and ver == 0:
+            # 官方总是带「当前版本」查询（InstallLib 日志 54->54）；0 可能不是
+            # 合法入参。有锚点（本机官方安装版本）就按官方姿势重试一次。
+            hint = _registry_version()
+            if hint:
+                log("[更新] local_version=0 未取得版本号，按官方姿势改用锚点 %d 重试"
+                    % hint)
+                live, api_url = _dpms_call(hint)
+        if live:
+            url = api_url or url
+            source = "DPMS API"
+            determined = True
+            log("[更新] 服务端最新版本 %d（%s）" % (live, source))
     except Exception as exc:
         log("[更新] 版本接口不可用（%s）" % exc)
-        if allow_probe and probe_tpls:
-            # 全新安装（ver=0）时没有「当前版本」可作起点：
-            # 用机器级注册表版本做锚点（只当锚点，不当本地版本）；
-            # 连锚点都没有 → 探测无法定界，如实报错让用户先登录。
-            hint = _registry_version() if (ignore_registry and not ver) else 0
-            start = (ver or hint) + 1
-            sanity = ver or hint
-            if not sanity:
-                probe_error = "全新目录且无版本锚点 —— 请先登录后重试（登录后走权威 API）"
-                log("[更新] %s" % probe_error)
+    if not determined and allow_probe and probe_tpls:
+        # 全新安装（ver=0）时没有「当前版本」可作起点：
+        # 用机器级注册表版本做锚点（只当锚点，不当本地版本）；
+        # 连锚点都没有 → 探测无法定界，如实报错让用户先登录。
+        hint = _registry_version() if (ignore_registry and not ver) else 0
+        start = (ver or hint) + 1
+        sanity = ver or hint
+        if not sanity:
+            probe_error = "全新目录且无版本锚点 —— 请先登录后重试（登录后走权威 API）"
+            log("[更新] %s" % probe_error)
+        else:
+            probed, perr = probe_latest_version(probe_tpls, start, session,
+                                                sanity_version=sanity)
+            if perr:
+                probe_error = perr
+                log("[更新] 清单探测不可用：%s" % perr)
             else:
-                probed, perr = probe_latest_version(probe_tpls, start, session,
-                                                    sanity_version=sanity)
-                if perr:
-                    probe_error = perr
-                    log("[更新] 清单探测不可用：%s" % perr)
+                # 到达 404 边界。probed>0 = 发现了更新版本；
+                # probed==0 = 「没有更新的版本」—— 但当前版本（sanity）
+                # 已实测存在，其清单就是安装/修复要用的目标。
+                determined = True
+                live = probed or sanity
+                url = probe_tpls[1] % live
+                source = "清单探测"
+                if probed:
+                    log("[更新] 探测到最新版本 %d（%s）" % (live, source))
                 else:
-                    # 到达 404 边界。probed>0 = 发现了更新版本；
-                    # probed==0 = 「没有更新的版本」—— 但当前版本（sanity）
-                    # 已实测存在，其清单就是安装/修复要用的目标。
-                    determined = True
-                    live = probed or sanity
-                    url = probe_tpls[1] % live
-                    source = "清单探测"
-                    if probed:
-                        log("[更新] 探测到最新版本 %d（%s）" % (live, source))
-                    else:
-                        log("[更新] 探测确认：没有更新的版本（目标版本 %d）" % live)
+                    log("[更新] 探测确认：没有更新的版本（目标版本 %d）" % live)
 
     # 版本旁证：目标版本的 buildInfo.json（非权威，失败不阻断）
     bi_note = ""
@@ -2040,6 +2071,34 @@ def selftest():
                     info2.get("probe_error", "")[:40])
             finally:
                 globals()["_registry_version"] = orig_reg
+
+            # ㉗e DPMS API 响应三态（09-19 用户实测：200+令牌被接受但无 live_version）：
+            #   ① 200+value 正常 → 直接用；② 200+code≠0 → 报错并降级探测；
+            #   ③ 200 但无 live_version → 记录原文并降级探测（锚点兜底）
+            def _check_with_api_body(body):
+                routes = {
+                    "https://api.onstove.com": (200, body),
+                    "STOVE_CHAOSZERO_54_v2.json": (
+                        200, json.dumps({"version_no": 54}).encode()),
+                    "STOVE_CHAOSZERO_55": (404, b"x"),
+                    "buildInfo.json": (404, b"x"),
+                }
+                return check(froot, session=_FakeRouteSession(routes),
+                             ignore_registry=True, token="T" * 384,
+                             on_event=lambda m: None)
+
+            i1 = _check_with_api_body(json.dumps({
+                "code": 0, "value": {"live_version": 54,
+                                     "live_project_file_url": "U54"}}).encode())
+            chk("DPMS-正常响应直接用", i1["determined"] and i1["live"] == 54
+                and i1["source"] == "DPMS API", str(i1["live"]))
+            i2 = _check_with_api_body(json.dumps({
+                "code": 70701, "message": "invalid parameter"}).encode())
+            chk("DPMS-code≠0 降级探测", i2["determined"] and i2["live"] == 54
+                and i2["source"] == "清单探测", i2["source"])
+            i3 = _check_with_api_body(b'{"code":0,"value":{}}')
+            chk("DPMS-无版本号降级探测", i3["determined"] and i3["live"] == 54,
+                str(i3["live"]))
 
             # ㉗ 配置项必须真的被读到（防止「声明了没接上」）
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
