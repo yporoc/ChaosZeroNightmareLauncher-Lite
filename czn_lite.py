@@ -978,6 +978,44 @@ def _caller_detail():
         return None
 
 
+def _ensure_caller_detail():
+    """拿到 CallerDetail；全新环境（从未装过官方 STOVE）没有就生成并写回。
+
+    依据《从0环境完整进游戏_全新安装方案_v1》§4-G1：官方 STOVESetup 会在
+    HKCU\\SOFTWARE\\SGUP 写 40-hex 安装指纹，我们模仿同款行为（值格式对齐
+    4a54eb8fe96aa7644aae18adc4bd5dcfd2ae9f7b）。服务端是否校验指纹值未验证，
+    故另有 70702 自愈重试（StoveAuth.game_check 内）。"""
+    value = _caller_detail()
+    if value:
+        return value
+    import secrets
+    value = secrets.token_hex(20)
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\SGUP",
+                                 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "CallerDetail", 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        print("[*] 全新环境：已生成并写入 CallerDetail 安装指纹")
+    except Exception as exc:
+        print("[!] CallerDetail 写注册表失败（本次请求仍携带生成值）：%s" % exc)
+    return value
+
+
+def _rotate_caller_detail():
+    """强制换新 CallerDetail 并写回注册表（gc/check 70702 自愈重试用）。"""
+    import secrets
+    value = secrets.token_hex(20)
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\SGUP",
+                                 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "CallerDetail", 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        print("[*] CallerDetail 已轮换（自愈重试）")
+    except Exception as exc:
+        print("[!] CallerDetail 轮换写注册表失败：%s" % exc)
+    return value
+
+
 def machine_guid():
     """读取注册表 HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid。
     仅用于诊断输出；官方 signin 请求体经抓包确认不含 device_id。"""
@@ -1367,7 +1405,7 @@ class StoveAuth:
             "X-Timezone": self.gds.get("timezone", "Asia/Tokyo"),
             "X-Utc-Offset": str(int(self.gds.get("utc_offset", 540))),
         }
-        caller_detail = _caller_detail()
+        caller_detail = _ensure_caller_detail()
         if caller_detail:
             headers["Caller-Detail"] = caller_detail
         headers["Transaction-ID"] = self.session_tid
@@ -1628,19 +1666,35 @@ class StoveAuth:
             "skip_session_check": bool(skip_session),
         }
         token = self.launcher_access or self.game_access_token
+        print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
+              % self.session_tid)
         headers = self._official_headers({
             "Authorization": "bearer " + str(token),
             "market-name": "PC_MARKET",
             "Captcha-Token": "",
         })
-        print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
-              % self.session_tid)
         r = self.s.post(API_BASE + "/gc/v1.4/check/" + GAME_ID, json=body,
                         headers=headers, timeout=20)
         try:
-            return r.status_code, r.json(), r.text
+            data = r.json()
         except Exception:
-            return r.status_code, None, r.text
+            data = None
+        # 70702 = 服务端拒绝 Caller-Detail（全新环境指纹缺失/失效）：
+        # 轮换安装指纹后原样重试一次（方案 v1 §4-G1 自愈路径）
+        if isinstance(data, dict) and str(data.get("code")) == "70702":
+            if _rotate_caller_detail():
+                headers = self._official_headers({
+                    "Authorization": "bearer " + str(token),
+                    "market-name": "PC_MARKET",
+                    "Captcha-Token": "",
+                })
+                r = self.s.post(API_BASE + "/gc/v1.4/check/" + GAME_ID, json=body,
+                                headers=headers, timeout=20)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = None
+        return r.status_code, data, r.text
 
     def game_token(self):
         """兑换游戏级令牌（两步，缺第二步必报 41002）：

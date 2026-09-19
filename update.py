@@ -54,6 +54,9 @@ BACKUP_SUFFIX = ".cznbak"
 
 # 清单 URL 兜底探测的起始偏移与上限（官方 DPMS 路径可推导）
 PROBE_MAX_AHEAD = 12
+# DPMS 清单命名约定基址（实测证据：.upf project_url 与官方抓包同构
+# <base>/<GAME_ID>_<N>.json / _v2.json）。全新安装（无 .upf）时由此构造探测模板。
+DPMS_BASE_DEFAULT = "http://chaoszero-dl.game.onstove.com/game/dpms_STOVE_CHAOSZERO"
 
 # 单文件重试次数（网络抖动）
 RETRY = 3
@@ -1181,6 +1184,25 @@ def check_gamedata(root=None, session=None, on_event=None, entry_url=None):
 # ====================================================================
 # 编排
 # ====================================================================
+def _probe_templates(url):
+    """探测地址的 v1/v2 双形态模板。
+
+    有 .upf 时从 project_url 推导（现状）；全新安装（无 .upf）时由 DPMS 命名
+    约定基址（config: update.dpms_manifest_url_base）构造 —— 本地版本为 0，
+    从 local_version+1=1 起探测。"""
+    if url:
+        base = url.split("?")[0].rsplit("/", 1)[0]
+        m = re.search(r"/([^/]+?)_\d+(_v2)?\.json$", url.split("?")[0])
+        code = m.group(1) if m else cl.GAME_ID
+    else:
+        base = _u_str("dpms_manifest_url_base", DPMS_BASE_DEFAULT).rstrip("/")
+        code = cl.GAME_ID
+    if not base:
+        return []
+    return [base + "/" + code + "_%d_v2.json",
+            base + "/" + code + "_%d.json"]
+
+
 def check(root=None, session=None, on_event=None, allow_probe=None):
     """只读：判断本地版本与最新版本。
 
@@ -1198,14 +1220,7 @@ def check(root=None, session=None, on_event=None, allow_probe=None):
 
     upf = read_upf(root) or {}
     url = str(upf.get("project_url") or "")
-    probe_tpls = []
-    if url:
-        # 探测模板：v1/v2 两种形态都试（官方已切 v2，但 v1 仍在线）
-        base = url.split("?")[0].rsplit("/", 1)[0]
-        m = re.search(r"/([^/]+?)_\d+(_v2)?\.json$", url.split("?")[0])
-        code = m.group(1) if m else cl.GAME_ID
-        probe_tpls = [base + "/" + code + "_%d_v2.json",
-                      base + "/" + code + "_%d.json"]
+    probe_tpls = _probe_templates(url)
 
     live, source, probe_error = 0, "", ""
     determined = False
@@ -1296,7 +1311,7 @@ def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=Non
 def update(root=None, session=None, on_event=None, cancel=None,
            workers=None, resume=None, backup=None, dry_run=False,
            on_progress=None, force=False, manifest_url=None,
-           restore_modified=None):
+           restore_modified=None, install=False):
     """完整流程：检查 → 计划 → 执行。
 
     参数为 None 时从 config.json 的 update 段取默认值。
@@ -1304,6 +1319,9 @@ def update(root=None, session=None, on_event=None, cancel=None,
     force=True               忽略版本比较，直接用当前清单做一次全量比对（「修复」）。
     manifest_url=...         直接指定清单，跳过版本检查（排障 / 离线 / 自检用）。
     restore_modified=True    同版本时也把「与官方不同」的文件恢复成官方原版。
+    install=True             全新安装（方案 v1 §4-G4）：install_root 允许不存在
+                             （自动创建）；本地版本按 0 处理 → 计划=全量 20 文件。
+                             资源层（cznlive）不由本流程处理 —— 首跑由游戏引擎自建。
 
     关于「与官方不同」的文件：
       · 大更新（版本号变了）→ 一律按官方清单替换，包括被补丁/汉化改过的游戏主程序；
@@ -1314,6 +1332,11 @@ def update(root=None, session=None, on_event=None, cancel=None,
     """
     log = on_event or (lambda m: None)
     root = _root(root)
+    if install and root:
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as exc:
+            return Result(False, "无法创建安装目录 %s：%s" % (root, exc))
     if not root or not os.path.isdir(root):
         return Result(False, "install_root 未配置或不存在")
 
@@ -1435,6 +1458,8 @@ def main(argv=None):
                     help="只识别/检测游戏资源层（cznlive，只读不下载）")
     ap.add_argument("--verify", action="store_true", help="全量完整性校验（只读）")
     ap.add_argument("--update", action="store_true", help="检查并执行更新")
+    ap.add_argument("--install", action="store_true",
+                    help="全新安装：向 install_root 完整安装游戏本体（资源层由游戏首跑自建）")
     ap.add_argument("--repair", action="store_true", help="按当前清单做一次全量比对修复")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不做改动")
     ap.add_argument("--workers", type=int, default=1, help="并发下载数（1-32，默认 1）")
@@ -1451,6 +1476,9 @@ def main(argv=None):
         r = check_gamedata(root, on_event=print)
     elif a.verify:
         r = verify(root, on_event=print)
+    elif a.install:
+        r = update(root, on_event=print, workers=a.workers,
+                   dry_run=a.dry_run, install=True)
     elif a.update or a.repair:
         r = update(root, on_event=print, workers=a.workers,
                    dry_run=a.dry_run, force=a.repair)
@@ -1901,11 +1929,27 @@ def selftest():
             chk("更新不触碰资源层", before_app == snap_appdata(),
                 "%d 个资源文件" % len(before_app))
 
+            # ㉗b 全新安装模式：空目录 → 全量安装 + 账本（方案 v1 §4-G4）
+            iroot = os.path.join(tmp, "fresh")
+            os.makedirs(iroot, exist_ok=True)
+            ri = update(iroot, manifest_url=used, install=True,
+                        on_event=lambda m: None)
+            chk("install 模式", ri.ok and ri.downloaded == 3
+                and (read_upf(iroot) or {}).get("local_version") == 7, ri.message)
+            chk("install 账本", len(read_cache(iroot)) == 3
+                and os.path.isdir(os.path.join(iroot, "bin")))
+            # 探测模板：无 .upf 时由 DPMS 命名约定构造（全新安装用，纯字符串）
+            tpls = _probe_templates(None)
+            chk("install 探测模板", len(tpls) == 2
+                and all(cl.GAME_ID in t for t in tpls)
+                and tpls[0].endswith("_%d_v2.json"), tpls[0] if tpls else "-")
+
             # ㉗ 配置项必须真的被读到（防止「声明了没接上」）
             keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
                     "resume", "backup_before_replace", "restore_modified",
                     "keep_temp", "probe_fallback", "check_vcredist",
-                    "buildinfo_check", "gameres_entry_url", "gameres_appid",
+                    "buildinfo_check", "dpms_manifest_url_base",
+                    "gameres_entry_url", "gameres_appid",
                     "gameres_ns", "gameres_build", "gameres_world",
                     "gameres_branch")
             wired = [k for k in keys if _u_bool(k, None) is not None

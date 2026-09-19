@@ -67,6 +67,7 @@
   "probe_fallback": true,
   "check_vcredist": true,
   "buildinfo_check": true,
+  "dpms_manifest_url_base": "http://chaoszero-dl.game.onstove.com/game/dpms_STOVE_CHAOSZERO",
   "gameres_entry_url": "https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive",
   "gameres_appid": "cznlive",
   "gameres_ns": "ssr-base-260909",

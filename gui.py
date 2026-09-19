@@ -356,20 +356,29 @@ class App(ctk.CTk):
         _small("update", "检查更新",   lambda: self._run_task(self._task_check_update), 5, 0)
         _small("verify", "校验完整性", lambda: self._run_task(self._task_verify_files), 5, 1)
 
+        # ★ 全新安装（整行）：空目录 → 前置体检 → 269MB 本体 → 游戏首跑自建资源
+        #   （方案 v1：对话框在主线程，重活在 _run_task 工作线程）
+        _bi = ctk.CTkButton(qr, text="全新安装（空目录 → 完整进游戏）",
+                            command=self._on_install,
+                            height=36, font=ui_font, fg_color=C_BTN,
+                            hover_color=C_BTN_HOV, corner_radius=8)
+        _bi.grid(row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=2)
+        self.btn["install"] = _bi
+
         # 图像标签: 无文件=完全空白; 尺寸动态适配不写死
         # (旧"扫码登录"文字标题已删 —— 与同名按钮重复, 纯困惑)
         # ★ columnspan=2: 必须跨满两列, 否则二维码被挤进半列宽(实测 217px 缩水)
         self.qr_label = ctk.CTkLabel(qr, text="", fg_color="transparent")
         # 二维码遮罩: 只盖图片区, 不影响上方按钮
         self.qr_cover = ctk.CTkFrame(qr, fg_color="#000000", corner_radius=0)
-        self.qr_label.grid(row=6, column=0, columnspan=2, padx=12,
+        self.qr_label.grid(row=7, column=0, columnspan=2, padx=12,
                            pady=(4, 2), sticky="nsew")
         self.qr_label.bind("<Button-1>", self._on_qr_click)   # 点击→打开本地 png
         self.qr_label.bind("<Configure>", self._on_qr_panel_resize)  # 尺寸自校正
         ctk.CTkLabel(qr, text="点击二维码打开本地png",   # 短文案, 防两侧截断
                      font=ctk.CTkFont("Microsoft YaHei UI", 11),
                      text_color=C_DIM, wraplength=272,
-                     justify="center").grid(row=7, column=0, columnspan=2,
+                     justify="center").grid(row=8, column=0, columnspan=2,
                                             pady=(4, 12))
         qr.bind("<Configure>", self._on_qr_panel_resize)
 
@@ -1261,6 +1270,118 @@ class App(ctk.CTk):
             return
         self.set_status("状态: 校验完成" if r.ok else "状态: 校验发现异常")
 
+    # ---- 任务 2b: 全新安装（空目录 → 完整进游戏，方案 v1） ----
+    def _on_install(self):
+        """主线程前置：目录选择 + 体检 + 征得同意（tkinter 对话框必须主线程），
+        然后把重活交给工作线程 _task_install。"""
+        from tkinter import filedialog, messagebox
+        import prereqs as pr
+        d = filedialog.askdirectory(
+            title="全新安装：选择游戏安装目录（建议空目录，需约 22 GB）")
+        if not d:
+            return
+        d = os.path.normpath(d)
+        ok, note = pr.disk_ok(d)
+        self.log_line("[体检] %s：%s" % (d, note))
+        if not ok:
+            messagebox.showerror("磁盘空间不足", note)
+            return
+        missing = []
+        v_ok, v_note = pr.check_vcredist_detailed()
+        self.log_line("[体检] %s" % v_note)
+        if not v_ok:
+            missing.append("vc")
+        w_ok, w_note = pr.check_webview2()
+        self.log_line("[体检] %s" % w_note)
+        if not w_ok:
+            missing.append("webview2")
+        if missing and not messagebox.askyesno(
+                "安装系统前置组件",
+                "%s\n\n将下载微软官方安装器并提权静默安装，是否继续？"
+                % "\n".join("· 需要 %s" % ("VC++ 2022 x64 运行时" if m == "vc"
+                                           else "WebView2 运行时")
+                            for m in missing)):
+            self.log_line("[*] 已取消（未安装前置组件）")
+            return
+        self._run_task(lambda: self._task_install(
+            d, "vc" in missing, "webview2" in missing))
+
+    def _task_install(self, root_dir, do_vc, do_webview2):
+        import prereqs as pr
+        cl.set_stage("全新安装")
+        self.set_status("状态: 全新安装中…")
+        workdir = os.path.dirname(os.path.abspath(cl.__file__))
+
+        def agree(_msg):        # 同意已在主线程对话框里给出
+            return True
+        if do_vc:
+            ok, note = pr.ensure_vc_redist(agree, workdir, self.log_line)
+            self.log_line("[%s] %s" % ("+" if ok else "!", note))
+            if not ok:
+                self.set_status("状态: 前置安装失败")
+                return
+        if do_webview2:
+            ok, note = pr.ensure_webview2(agree, workdir, self.log_line)
+            self.log_line("[%s] %s" % ("+" if ok else "!", note))
+            if not ok:
+                self.set_status("状态: 前置安装失败")
+                return
+        try:
+            cl.set_install_root(root_dir)
+        except Exception as exc:
+            self.log_line("[x] 写入安装目录失败：%s" % exc)
+            self.set_status("状态: 全新安装失败")
+            return
+        self.log_line("[*] 安装目录已设定：%s" % root_dir)
+        upd = self._upd()
+        if upd is None:
+            return
+        r = upd.update(cl.INSTALL_ROOT, on_event=self.log_line,
+                       cancel=self._cancel.is_set, install=True)
+        self.log_line("[%s] %s" % ("+" if r.ok else "x", r.message))
+        for e, why in r.failed:
+            self.log_line("    - %s：%s" % (e.rel, why))
+        if r.ok:
+            self.log_line("[*] 本体安装完成。接下来：登录 → 启动游戏 → "
+                          "首次运行时游戏会自行下载 ~19.9 GB 资源（本启动器只读汇报进度）")
+            self.set_status("状态: 本体已安装，等待登录启动")
+        else:
+            self.set_status("状态: 全新安装失败（可重入，已下载部分会续传）")
+
+    def _first_run_monitor(self):
+        """首跑资源自建只读监控：游戏运行期间统计 cznlive 体积与账本组数，
+        有变化才打一行日志。零写入、零干预（方案 v1 §5 [自建] 环节）。"""
+        import glob as _glob
+        import update as upd
+        self.log_line("[首跑] 开始监控资源自建（只读，每 6s 采样）…")
+        last = (-1, -1)
+        quiet = 0
+        d = upd.gamedata_dir()
+        while not self._cancel.is_set() and quiet < 15:
+            try:
+                size = 0
+                for base, _dirs, files in os.walk(d):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(base, f))
+                        except OSError:
+                            pass
+                n = len(_glob.glob(os.path.join(
+                    d, "data.indices", "pcrevs", "*.pcrevsz")))
+                if (size, n) != last:
+                    self.log_line("[首跑] 资源自建中：%.2f GB（子组账本 %d 组）"
+                                  % (size / 1073741824, n))
+                    last = (size, n)
+                    quiet = 0
+                else:
+                    quiet += 1
+            except Exception:
+                quiet += 1
+            time.sleep(6)
+        if last[0] > 0:
+            self.log_line("[首跑] 监控结束（%.2f GB / %d 组账本；无变化自动收起）"
+                          % (last[0] / 1073741824, last[1]))
+
     # ---- 任务 3: 启动游戏(全流程一键) ----
     def _task_launch(self):
         cl.set_stage("启动游戏")
@@ -1358,6 +1479,10 @@ class App(ctk.CTk):
             self.log_line("[dbg] 成功判据: %%LOCALAPPDATA%%\\STOVEPCSDK3\\logs\\"
                           "STOVE_CHAOSZERO\\BaseSDK_*.log 出现 Base_SetGameProfileCpp")
             self.set_status("状态: 游戏运行中 (管道保活中)")
+            # 首跑资源自建只读监控（全新安装场景的 19.9 GB 由游戏引擎自建；
+            # 已装好的环境无变化时监控静默自动收起）
+            threading.Thread(target=self._first_run_monitor,
+                             daemon=True).start()
         else:
             self.log_line("[x] 启动失败")
             self.set_status("状态: 启动失败")
