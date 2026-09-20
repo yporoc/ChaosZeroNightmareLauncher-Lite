@@ -397,7 +397,7 @@ class App(ctk.CTk):
         self.btn_net = ctk.CTkButton(
             bar, text="网络: —", command=self._open_network, height=24, width=250,
             font=ctk.CTkFont("Microsoft YaHei UI", 12), fg_color="transparent",
-            hover_color=C_BTN_HOV, text_color=C_DIM, corner_radius=6)
+            hover_color=C_BTN_HOV, text_color=C_FG, corner_radius=6)
         self.btn_net.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self._apply_layout()               # 按开关初始状态排布一次
 
