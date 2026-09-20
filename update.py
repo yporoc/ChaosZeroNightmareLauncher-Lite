@@ -485,6 +485,12 @@ def _get_bytes(url, session=None, timeout=30):
     return r.content
 
 
+def _tail(url, n=34):
+    """日志里用 URL 尾部就够了（前缀是固定的 DPMS 目录）。"""
+    u = str(url).split("?")[0]
+    return "…" + u[-n:] if len(u) > n else u
+
+
 def _probe_status(url, session):
     """探测单个 URL：返回 'ok' / '404' / 其它情况的说明文本。
 
@@ -499,7 +505,8 @@ def _probe_status(url, session):
             code = int(getattr(exc, "code", 0))
             if code == 404:
                 return "404"
-            last = "HTTP %s（CDN 可能限流或拦截）" % (code or "?")
+            last = "HTTP %s（重试 3 次仍 %s；CDN 可能限流或拦截）" % (code or "?",
+                                                                    code or "?")
         except Exception as exc:
             last = "探测失败：%s" % exc
         if attempt < 3:
@@ -508,7 +515,7 @@ def _probe_status(url, session):
 
 
 def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_AHEAD,
-                         sanity_version=0):
+                         sanity_version=0, on_event=None):
     """免鉴权兜底：从 start 起递增探测清单，返回 (最新版本, 错误说明)。
 
     语义（证据：同一 CDN 对「不存在的版本」昨天回 404、今天回 403 —— 返回码漂移）：
@@ -518,21 +525,31 @@ def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_
         都拿不到 ⇒ 探测通道不可信，如实报错 —— 绝不能把 403/网络错误悄悄
         当成「没有更新」。
     """
+    log = on_event or (lambda m: None)
     tpls = list(manifest_url_tpl) if isinstance(manifest_url_tpl, (list, tuple)) \
         else [manifest_url_tpl]
     if sanity_version:
         st = _probe_status(tpls[0] % sanity_version, session)
+        log("[探测] 通道自检：版本 %d 清单 %s → %s"
+            % (sanity_version, _tail(tpls[0] % sanity_version),
+               "可读，通道可信" if st == "ok" else st))
         if st != "ok":
             return 0, "探测通道不可信（当前版本 %d 清单 %s）" % (sanity_version, st)
     best = 0
     for n in range(start, start + limit + 1):
         sts = [_probe_status(t % n, session) for t in tpls]
+        log("[探测] 版本 %d：%s" % (n, "，".join(
+            "%s→%s" % (_tail(t % n, 12), s) for t, s in zip(tpls, sts))))
         if "ok" in sts:
             best = n
             continue
         if all(s == "404" for s in sts):
+            log("[探测] 到达 404 边界：最新版本 %d" % (best or 0))
             return best, ""
-        return best, next((s for s in sts if s != "404"), "?")
+        err = next((s for s in sts if s != "404"), "?")
+        log("[探测] 未能定界：%s —— 403 不能当作「没有新版本」的证据，"
+            "结论只能靠登录后的权威 API" % err)
+        return best, err
     return best, ""
 
 
@@ -729,12 +746,13 @@ def _etag_ok(url, session, md5_packed):
 
 
 def download_entry(root: str, e: Entry, manifest_url: str, session=None,
-                   resume=True, backup=True, on_progress=None):
+                   resume=True, backup=True, on_progress=None, on_event=None):
     """下载 → 两级 MD5 → 解压 → 原子替换。
 
     临时文件放在 <root>\\.stove_temp\\<group>_<seq>.gz（与官方一致），
     解压产物先落在目标同目录的 .cznnew，校验通过后再 rename —— 保证替换是原子的。
     """
+    log = on_event or (lambda m: None)
     os.makedirs(temp_dir(root), exist_ok=True)
     dst = e.at(root)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -747,10 +765,16 @@ def download_entry(root: str, e: Entry, manifest_url: str, session=None,
 
     # ---- 1) 拿压缩包（支持续传）----
     have = os.path.getsize(gz) if os.path.exists(gz) else 0
+    log("[下载] %s ← %s（%.1f/%.1f MB，本地断点 %.1f MB）"
+        % (e.rel, _tail(url, 26), (e.packed or 0) / 1048576,
+           (e.size or 0) / 1048576, have / 1048576))
     if have and e.md5_packed and resume:
         # ETag 预检：服务端对象已换（ETag ≠ 清单 md5_packed）⇒ 本地任何断点/
         # 缓存都作废，直接重下（省得对着坏对象续传，或下载完才在 MD5 上失败）
         et = _etag_ok(url, s, e.md5_packed)
+        log("[下载]   ETag 预检：%s" % ("相符 → 断点可用" if et is True else
+                                    "不符 ⇒ 丢弃断点重下" if et is False else
+                                    "服务端未给 ETag ⇒ 无法判断，照常续传"))
         if et is False:
             try:
                 os.remove(gz)
@@ -764,18 +788,21 @@ def download_entry(root: str, e: Entry, manifest_url: str, session=None,
             have = 0
         elif have == e.packed and (not e.md5_packed or md5_file(gz) == e.md5_packed):
             need_dl = False                        # 已完整且校验通过
+            log("[下载]   断点已完整且压缩包 MD5 OK → 跳过下载")
         elif have == e.packed:
             os.remove(gz)
             have = 0
+            log("[下载]   断点大小对但 MD5 不符 → 丢弃重下")
 
     if need_dl:
         _download_to(gz, url, s, resume=resume and have > 0, have=have,
-                     expect_size=e.packed, on_progress=on_progress)
+                     expect_size=e.packed, on_progress=on_progress, on_event=log)
 
     if e.md5_packed and md5_file(gz) != e.md5_packed:
         if os.path.exists(gz):
             os.remove(gz)
         raise RuntimeError("压缩包 MD5 不符（已丢弃，可重试）")
+    log("[下载]   压缩包 MD5 OK（%s）" % (e.md5_packed or "清单未给，跳过比对"))
 
     # ---- 2) 解压到目标同目录的临时文件 ----
     new = dst + ".cznnew"
@@ -795,21 +822,26 @@ def download_entry(root: str, e: Entry, manifest_url: str, session=None,
     if e.md5 and md5_file(new) != e.md5:
         os.remove(new)
         raise RuntimeError("解压后 MD5 不符（已丢弃，可重试）")
+    log("[下载]   解压 %.1f MB OK → 原始 MD5 OK" % (written / 1048576))
 
     if backup and os.path.exists(dst):
         try:
             shutil.copy2(dst, dst + BACKUP_SUFFIX)
+            log("[下载]   原文件已备份 → %s%s" % (e.rel, BACKUP_SUFFIX))
         except Exception:
             pass                                    # 备份失败不阻断
     os.replace(new, dst)
     return written
 
 
-def _download_to(dst, url, session, resume=False, have=0, expect_size=0, on_progress=None):
+def _download_to(dst, url, session, resume=False, have=0, expect_size=0,
+                 on_progress=None, on_event=None):
     """HTTP 下载；resume=True 且已有部分内容时用 Range 续传。"""
+    log = on_event or (lambda m: None)
     headers = {}
     if resume and have:
         headers["Range"] = "bytes=%d-" % have
+        log("[下载]   Range 续传：从 %.1f MB 处接着下" % (have / 1048576))
     last = None
     for attempt in range(1, RETRY + 1):
         try:
@@ -820,6 +852,8 @@ def _download_to(dst, url, session, resume=False, have=0, expect_size=0, on_prog
             if code == 206:
                 mode = "ab"
             else:
+                if resume and have:
+                    log("[下载]   服务端回 200 而非 206 → 不支持续传，全量重下")
                 mode = "wb"
                 have = 0
             total = have
@@ -838,6 +872,8 @@ def _download_to(dst, url, session, resume=False, have=0, expect_size=0, on_prog
         except Exception as exc:
             last = exc
             if attempt < RETRY:
+                log("[下载]   第 %d/%d 次失败（%s）→ 等待后重试"
+                    % (attempt, RETRY, exc))
                 time.sleep(RETRY_BACKOFF * attempt)
     raise RuntimeError("下载失败：%s" % last)
 
@@ -874,7 +910,7 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
             raise RuntimeError("已取消")
         n = download_entry(root, e, manifest_url, sess,
                            resume=resume, backup=backup,
-                           on_progress=on_progress)
+                           on_progress=on_progress, on_event=log)
         return e, n
 
     if workers > 1 and total > 1:
@@ -897,7 +933,8 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
                     done += 1
                     res.downloaded += 1
                     res.bytes_written += n
-                    log("[更新] %d/%d 完成 %s" % (done, total, e.rel))
+                    log("[更新] %d/%d OK %s（落地 %.1f MB）"
+                        % (done, total, e.rel, n / 1048576))
                 except Exception as exc:
                     res.ok = False
                     res.failed.append((e, str(exc)))
@@ -909,7 +946,8 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
                 done += 1
                 res.downloaded += 1
                 res.bytes_written += n
-                log("[更新] %d/%d 完成 %s" % (done, total, e.rel))
+                log("[更新] %d/%d OK %s（落地 %.1f MB）"
+                    % (done, total, e.rel, n / 1048576))
             except Exception as exc:
                 res.ok = False
                 res.failed.append((e, str(exc)))
@@ -939,9 +977,15 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
         ok, _ = verify_entry(root, e)
         if ok:
             good.append(e)
+        else:
+            log("[账本]   ★ 提交前回读未通过，不写入账本：%s" % e.rel)
     write_cache(root, good)
+    log("[账本] cacheii.db 已回写 %d/%d 行（installed_info UPSERT）"
+        % (len(good), len(manifest.files)))
     write_upf(root, manifest.version, manifest_url,
               extra={"game_title": manifest.raw.get("service_name") or ""})
+    log("[账本] .upf local_version=%d、project_url 已更新 → 本次更新算作「已提交」"
+        "（版本号最后写，中途失败不会留下半更新状态）" % manifest.version)
     res.message = "已更新到版本 %d" % manifest.version
     log("[更新] %s（%d 个文件，%.1f MB）"
         % (res.message, res.downloaded, res.bytes_written / 1048576))
@@ -1246,6 +1290,11 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
     if ignore_registry:
         note += "（全新安装：忽略机器级注册表）"
     log("[更新] 本地版本 %d（%s）" % (ver, note))
+    log("[更新] 目录 %s" % root)
+    log("[更新] 判定路径：%s" % ("权威 DPMS API（带 384 游戏级令牌）→ 拿不到版本才降级清单探测"
+                              if token else
+                              "无登录令牌 ⇒ live_version API 必 401（09-19 实测），"
+                              "只能走清单探测兜底；探测不能定界时如实报「无法确认」"))
 
     upf = read_upf(root) or {}
     url = str(upf.get("project_url") or "")
@@ -1267,6 +1316,8 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
         api = ("%s/dpms/game/v3.1/live_version?game_id=%s&local_version=%d&pc_room=false"
                % (cl.API, cl.GAME_ID, local_ver))
         headers = {"Authorization": "bearer " + token} if token else None
+        log("[更新] 权威 API：local_version=%d %s"
+            % (local_ver, "带令牌（%d 字符）" % len(token) if token else "无令牌"))
         r = _session(session).get(api, headers=headers, timeout=20)
         if getattr(r, "status_code", 0) != 200:
             raise _HttpError(r.status_code, api)
@@ -1282,6 +1333,10 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
         lv = int(val.get("live_version") or 0)
         if not lv:
             log("[更新] DPMS 响应未含 live_version，原文（截断）：%s" % body[:240])
+        else:
+            log("[更新] DPMS 响应：live_version=%d 清单=%s 键=%s"
+                % (lv, _tail(str(val.get("live_project_file_url") or "")),
+                   ",".join(sorted(val)[:6]) or "无"))
         return lv, str(val.get("live_project_file_url") or "")
 
     try:
@@ -1312,8 +1367,10 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
             probe_error = "全新目录且无版本锚点 —— 请先登录后重试（登录后走权威 API）"
             log("[更新] %s" % probe_error)
         else:
+            log("[更新] 清单探测：起点 v%d 起、锚点 v%d 自检、模板 %s"
+                % (start, sanity, " + ".join(_tail(t, 22) for t in probe_tpls)))
             probed, perr = probe_latest_version(probe_tpls, start, session,
-                                                sanity_version=sanity)
+                                                sanity_version=sanity, on_event=log)
             if perr:
                 probe_error = perr
                 log("[更新] 清单探测不可用：%s" % perr)
@@ -1351,11 +1408,22 @@ def verify(root=None, manifest_url=None, session=None, on_event=None, cancel=Non
     if not manifest_url:
         upf = read_upf(root) or {}
         manifest_url = str(upf.get("project_url") or "")
+        src = "本地 .upf 记录的 project_url"
+    else:
+        src = "调用方指定"
     if not manifest_url:
         return Result(False, "没有可用的清单地址（先「获取离线信息」）")
+    log("[校验] 清单来源：%s → %s" % (src, _tail(manifest_url, 46)))
+    t0 = time.time()
     man, used = fetch_manifest_preferred(manifest_url, session)
-    log("[校验] 清单 %s（版本 %d，%d 条）" % (used.split("?")[0], man.version, len(man.entries)))
+    log("[校验] 清单 %s（版本 %d，%d 条，形态 %s；受管文件 %d 个共 %.1f MB 待读）"
+        % (used.split("?")[0], man.version, len(man.entries),
+           "v2（16 列）" if used.split("?")[0].endswith("_v2.json") else "v1（13 列）",
+           len(man.files), sum(e.size or 0 for e in man.files) / 1048576))
     ok, bad = verify_all(root, man, on_event=log, cancel=cancel)
+    log("[校验] 逐个 MD5 比对完成：%d/%d，读取 %.1f MB，耗时 %.1f s"
+        % (ok, len(man.files), sum(e.size or 0 for e in man.files) / 1048576,
+           time.time() - t0))
     total = len(man.files)
     if not bad:
         return Result(True, "完整性校验通过（%d/%d）" % (ok, total), version=man.version)
@@ -1458,6 +1526,10 @@ def update(root=None, session=None, on_event=None, cancel=None,
     log("[更新] 目标版本 %d（%d 条记录，其中受管文件 %d 个）%s"
         % (man.version, len(man.entries), len(man.files),
            "  ← 大更新（本地 %d）" % local_ver if upgraded else ""))
+    log("[更新] 清单 %s（形态 %s，来源 %s）"
+        % (_tail(used, 46),
+           "v2/16 列" if used.split("?")[0].endswith("_v2.json") else "v1/13 列",
+           info.get("source") or "未知"))
     if man.main_exe:
         log("[更新] 游戏主程序：%s" % man.main_exe)
 
@@ -1492,6 +1564,7 @@ def update(root=None, session=None, on_event=None, cancel=None,
         return Result(True, "演练完成（未做任何改动）", version=man.version, plan=plan)
 
     if plan.is_empty():
+        log("[更新] 计划为空（清单与本地逐文件一致）→ 只回写账本，不改动任何文件")
         write_cache(root, man.files)
         write_upf(root, man.version, used)
         return Result(True, "已是目标版本 %d，无需改动" % man.version,
@@ -1499,6 +1572,8 @@ def update(root=None, session=None, on_event=None, cancel=None,
 
     need = int(plan.total_packed * 2.5) + (256 << 20)
     free = disk_free(root)
+    log("[更新] 磁盘预检：需约 %.1f MB（压缩量 ×2.5 + 256 MB 缓冲），可用 %s"
+        % (need / 1048576, "未知" if free is None else "%.1f GB" % (free / 1073741824)))
     if free is not None and free < need:
         return Result(False, "磁盘空间不足：需约 %.1f GB，可用 %.1f GB"
                       % (need / 1073741824, free / 1073741824), plan=plan)

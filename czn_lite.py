@@ -1666,10 +1666,13 @@ class StoveAuth:
             "skip_session_check": bool(skip_session),
         }
         token = self.launcher_access or self.game_access_token
+        # 没有任何令牌时**不发** Authorization 头 —— 发 "bearer None" 是假凭据，
+        # 既污染日志（09-20 用户日志实测）又可能被服务端按异常请求记账
+        auth = {"Authorization": "bearer " + str(token)} if token else {}
         print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
               % self.session_tid)
         headers = self._official_headers({
-            "Authorization": "bearer " + str(token),
+            **auth,
             "market-name": "PC_MARKET",
             "Captcha-Token": "",
         })
@@ -1684,7 +1687,7 @@ class StoveAuth:
         if isinstance(data, dict) and str(data.get("code")) == "70702":
             if _rotate_caller_detail():
                 headers = self._official_headers({
-                    "Authorization": "bearer " + str(token),
+                    **auth,
                     "market-name": "PC_MARKET",
                     "Captcha-Token": "",
                 })

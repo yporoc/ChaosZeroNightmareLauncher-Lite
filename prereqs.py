@@ -6,7 +6,7 @@
 r"""环境前置体检与安装（全新安装方案 v1 §4-G2/G3）。
 
 覆盖从 0 环境真正缺的三样东西：
-  · 磁盘空间（本体 269 MB + 首跑资源约 19.9 GB）
+  · 磁盘空间（本体 269 MB + 首跑资源数据包，实测约 5.5 GB）
   · VC++ 2022 x64 运行时（清单 vcredist 字段声明；缺失游戏起不来）
   · WebView2 Evergreen 运行时（ViewSDK.dll 290 处引用实证依赖；
     官方 STOVESetup 内置 MicrosoftEdgeWebview2Setup.exe 同款前置）
@@ -25,6 +25,7 @@ import urllib.request
 # 微软官方固定链接（永久重定向，非第三方镜像）
 VC_REDIST_X64_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 WEBVIEW2_BOOTSTRAP_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+_UA = "czn-lite/0.0.3"
 
 # WebView2 Evergreen 运行时的注册表位置（微软官方检测方式）
 _WEBVIEW2_KEYS = (
@@ -35,7 +36,8 @@ _WEBVIEW2_KEYS = (
 )
 _WEBVIEW2_DIR = r"Microsoft\EdgeWebView\Application"
 
-# 全新安装需要的磁盘体量：本体 269 MB + 首跑资源 ~19.9 GB + 工作缓冲
+# 全新安装的磁盘门槛：本体 269 MB + 首跑数据包（本机实测 cznlive 约 5.5 GB）+ 引擎
+# 自建时的 .bak/展开副本，按 4 倍留余量取 22 GB —— 宁多勿少，装到一半爆盘不可恢复
 NEED_GB = 22.0
 
 
@@ -104,23 +106,61 @@ def check_webview2():
     return False, "缺少 WebView2 运行时（游戏内 STOVE 商店/公告 UI 依赖）"
 
 
+def _net_channel():
+    """前置下载走哪条通道 —— 优先用启动器统一的出口（czn_lite._LoggedSession），
+    这样 config 里的 network.mode（直连 / 系统代理 / 手动代理）对微软官方安装器
+    的下载同样管得住，并且请求会进同一条日志。只有单独运行本模块（导入不到
+    czn_lite）才退回 urllib。"""
+    try:
+        import czn_lite as cl
+    except Exception:
+        return "urllib", None
+    return "czn_lite", cl
+
+
+def _fetch_urllib(url, dst, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, \
+            open(dst, "wb") as f:
+        while True:
+            b = resp.read(1 << 16)
+            if not b:
+                break
+            f.write(b)
+
+
+def _fetch_czn_session(cl, url, dst, timeout):
+    """经启动器的路由会话取回 url —— 直连时显式锁死代理，代理时按 network.mode 走。"""
+    s = cl._LoggedSession(cl.requests.Session(
+        impersonate="chrome", default_headers=False,
+        http_version=cl.CurlHttpVersion.V1_1))
+    r = s.get(url, timeout=timeout, stream=True, headers={"User-Agent": _UA})
+    code = getattr(r, "status_code", 0)
+    if code not in (200, 206):
+        raise RuntimeError("HTTP %s" % code)
+    with open(dst, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1 << 16):
+            if chunk:
+                f.write(chunk)
+
+
 def download(url: str, dst: str, on_event=None, timeout=60):
     """下载前置安装器到本地（微软官方固定链）。返回落地路径。"""
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    label, cl = _net_channel()
     last = None
     for attempt in (1, 2, 3):
         try:
             if on_event:
-                on_event("[前置] 下载 %s（第 %d 次）" % (url, attempt))
-            req = urllib.request.Request(url, headers={"User-Agent":
-                                                       "czn-lite/0.0.3"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp, \
-                    open(dst, "wb") as f:
-                while True:
-                    b = resp.read(1 << 16)
-                    if not b:
-                        break
-                    f.write(b)
+                on_event("[前置] 下载 %s（第 %d 次，通道=%s）"
+                         % (url, attempt, label))
+            # 先落 .part 再改名：任何一次中断都不会留下「半个安装器」被误执行
+            tmp = dst + ".part"
+            if cl is not None:
+                _fetch_czn_session(cl, url, tmp, timeout)
+            else:
+                _fetch_urllib(url, tmp, timeout)
+            os.replace(tmp, dst)
             size = os.path.getsize(dst)
             if on_event:
                 on_event("[前置] 下载完成：%.1f MB → %s"
@@ -223,6 +263,9 @@ def selftest():
     chk("WebView2 检测", isinstance(w_ok, bool), w_note[:44])
     chk("官方固定链", VC_REDIST_X64_URL.startswith("https://aka.ms/")
         and WEBVIEW2_BOOTSTRAP_URL.startswith("https://go.microsoft.com/"))
+    label, ch = _net_channel()
+    chk("前置下载遵循 network.mode", label == "czn_lite" and ch is not None,
+        "通道=%s" % label)
     chk("静默参数", "/quiet" in "/install /quiet /norestart"
         and "/silent" in "/silent /install")
     # 同意门：仅在组件确实缺失时才会走到下载前征询；已就绪则直接通过且不征询

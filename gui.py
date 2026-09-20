@@ -226,6 +226,8 @@ class App(ctk.CTk):
         self._tray = None               # 托盘（默认不启用）
         self._tray_menu = None          # 托盘右键菜单（需长期持有，见 _tray_popup）
         self._dl_last = 0.0             # 下载进度节流时间戳
+        self._upd_open = False          # 「下载游戏资源与更新」抽屉是否展开
+        self._upd_panel_told = False    # 抽屉首次展开时把说明打进日志（只一次）
         self.var_log = ctk.BooleanVar(value=True)   # 日志窗显示开关
         self.var_qr = ctk.BooleanVar(value=True)    # 二维码面板显示开关
         self.var_tray = ctk.BooleanVar(value=False)  # 托盘模式开关（默认关）
@@ -315,7 +317,8 @@ class App(ctk.CTk):
         qr.grid_propagate(False)
         qr.grid_columnconfigure(0, weight=1)
         qr.grid_columnconfigure(1, weight=1)
-        qr.grid_rowconfigure(6, weight=1)        # QR 图像区吃掉余量
+        qr.grid_rowconfigure(7, weight=1)        # 二维码图像区吃掉余量
+        #   （三个更新按钮移到底栏抽屉后，行 5/6 空出来，权重给 QR 本身）
         self.qr_panel = qr
 
         self.btn = {}
@@ -352,18 +355,8 @@ class App(ctk.CTk):
         _b.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14, pady=2)
         self.btn["pwd"] = _b
 
-        # ★ 游戏本体更新（整行两键）：检查更新 / 校验完整性
-        _small("update", "检查更新",   lambda: self._run_task(self._task_check_update), 5, 0)
-        _small("verify", "校验完整性", lambda: self._run_task(self._task_verify_files), 5, 1)
-
-        # ★ 全新安装（整行）：空目录 → 前置体检 → 269MB 本体 → 游戏首跑自建资源
-        #   （方案 v1：对话框在主线程，重活在 _run_task 工作线程）
-        _bi = ctk.CTkButton(qr, text="全新安装（空目录 → 完整进游戏）",
-                            command=self._on_install,
-                            height=36, font=ui_font, fg_color=C_BTN,
-                            hover_color=C_BTN_HOV, corner_radius=8)
-        _bi.grid(row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=2)
-        self.btn["install"] = _bi
+        # 更新相关的三个入口（检查更新 / 校验完整性 / 全新安装）已移到底栏
+        # 「下载游戏资源与更新」二级面板 —— 这里给扫码区腾位，行号不重排。
 
         # 图像标签: 无文件=完全空白; 尺寸动态适配不写死
         # (旧"扫码登录"文字标题已删 —— 与同名按钮重复, 纯困惑)
@@ -382,9 +375,12 @@ class App(ctk.CTk):
                                             pady=(4, 12))
         qr.bind("<Configure>", self._on_qr_panel_resize)
 
+        # ---- 更新抽屉（默认收起，展开时夹在日志与状态栏之间） ----
+        self.upd_panel = self._build_upd_panel()
+
         # ---- 状态栏: 左状态 + 右网络路径（点它打开网络设置） ----
         bar = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=8, height=34)
-        bar.grid(row=2, column=0, columnspan=2, sticky="ew",
+        bar.grid(row=3, column=0, columnspan=2, sticky="ew",
                  padx=16, pady=(0, 14))
         bar.grid_propagate(False)
         bar.grid_columnconfigure(0, weight=1)
@@ -392,11 +388,17 @@ class App(ctk.CTk):
                                    text_color=C_FG,
                                    font=ctk.CTkFont("Microsoft YaHei UI", 12))
         self.status.grid(row=0, column=0, sticky="ew", padx=(12, 6))
+        # 「下载游戏资源与更新」：本体更新/校验/全新安装 的抽屉入口（网络按钮左侧）
+        self.btn["updates"] = ctk.CTkButton(
+            bar, text="下载游戏资源与更新", command=self._toggle_updates,
+            height=24, width=148, font=ctk.CTkFont("Microsoft YaHei UI", 12),
+            fg_color=C_BTN, hover_color=C_BTN_HOV, corner_radius=6)
+        self.btn["updates"].grid(row=0, column=1, sticky="e", padx=(6, 6))
         self.btn_net = ctk.CTkButton(
             bar, text="网络: —", command=self._open_network, height=24, width=250,
             font=ctk.CTkFont("Microsoft YaHei UI", 12), fg_color="transparent",
             hover_color=C_BTN_HOV, text_color=C_DIM, corner_radius=6)
-        self.btn_net.grid(row=0, column=1, sticky="e", padx=(6, 8))
+        self.btn_net.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self._apply_layout()               # 按开关初始状态排布一次
 
     def _apply_layout(self):
@@ -1172,6 +1174,7 @@ class App(ctk.CTk):
         upd = upd or self._upd()
         if upd is None:
             return False
+        cl.set_stage("游戏更新")
         self.set_status("状态: 游戏本体更新中…")
         self._dl_last = 0.0
         r = upd.update(on_event=self.log_line, cancel=self._cancel.is_set,
@@ -1252,7 +1255,11 @@ class App(ctk.CTk):
         if upd is None:
             return
         self.set_status("状态: 检查游戏本体版本…")
-        info = upd.check(on_event=self.log_line, token=self._game_token_quiet())
+        token = self._game_token_quiet()
+        # 静默续期过程会把 stage 改成「令牌续期/兑换游戏级令牌」，改回来 ——
+        # 否则下面 DPMS/CDN/入口 API 的日志全部挂错阶段（09-20 用户日志实测）
+        cl.set_stage("检查更新")
+        info = upd.check(on_event=self.log_line, token=token)
         self.log_line("[*] ---- 游戏资源层（cznlive，由游戏引擎自己更新）----")
         upd.check_gamedata(cl.INSTALL_ROOT, on_event=self.log_line)
         if info.get("error"):
@@ -1292,6 +1299,104 @@ class App(ctk.CTk):
             self._do_update(upd, force=True)     # 版本可能已是最新，必须 force 才会比对修复
             return
         self.set_status("状态: 校验完成" if r.ok else "状态: 校验发现异常")
+
+    # ================= 二级面板：下载游戏资源与更新 =================
+    # 面板是**内嵌抽屉**（夹在日志区与状态栏之间），不是浮窗 —— 冒烟实测过浮窗
+    # 在 1920x1080 上必然压住日志区。抽屉方案让「开着面板也能看日志」成为结构
+    # 性保证：日志只是被挤掉几十像素，永远可见、永远可滚。
+    def _update_panel_items(self):
+        """面板条目表 —— 以后要加「资源层详情 / 预下载」只在这里追加一行，
+        按钮、说明、禁用联动、日志说明都会自动跟上。
+
+        元素：(key, 按钮文案, 一行说明, 回调)
+        说明写短：抽屉里要跟按钮挤同一行，长说明放日志与 README。
+        """
+        return [
+            ("update", "检查更新",
+             "本体最新版 + 资源层 cznlive 逐组比对（只读）",
+             lambda: self._run_task(self._task_check_update)),
+            ("verify", "校验完整性",
+             "受管文件逐个「存在+大小+MD5」（只读）",
+             lambda: self._run_task(self._task_verify_files)),
+            ("install", "全新安装（空目录 → 完整进游戏）",
+             "体检磁盘/VC++/WebView2 → 装本体约 269 MB",
+             self._on_install),
+        ]
+
+    def _build_upd_panel(self):
+        """构建抽屉（启动时一次，默认收起）。条目横向排布，右侧留伸展位。
+
+        条目一律从 `_update_panel_items()` 生成：以后新增功能只改那张表，
+        按钮宽度、说明文字、禁用联动、日志说明都会自动跟上。"""
+        pan = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=8, height=74)
+        pan.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16,
+                 pady=(0, 6))
+        pan.grid_propagate(False)
+        f = ctk.CTkFont("Microsoft YaHei UI", 13)
+        fs = ctk.CTkFont("Microsoft YaHei UI", 11)
+        head = ctk.CTkLabel(pan, text="更新与资源", text_color=C_DIM, font=fs)
+        head.grid(row=0, column=0, padx=(14, 8), pady=(10, 2), sticky="w")
+        col = 1
+        for key, text, _note, cmd in self._update_panel_items():
+            b = ctk.CTkButton(pan, text=text, command=cmd, height=30, width=150,
+                              font=f, fg_color=C_BTN, hover_color=C_BTN_HOV,
+                              corner_radius=8)
+            b.grid(row=0, column=col, padx=6, pady=(6, 2), sticky="w")
+            self.btn[key] = b                 # 复用 _set_buttons 的运行中禁用
+            col += 1
+        pan.grid_columnconfigure(col, weight=1)          # 预留：条目往左挤
+        ncols = col + 3
+        self._upd_note = ctk.CTkLabel(
+            pan, text="  ·  ".join(n for _k, _t, n, _c
+                                   in self._update_panel_items())
+            + "  ·  资源层（cznlive）由游戏引擎自己下载",
+            text_color=C_DIM, font=fs, justify="left", wraplength=1000)
+        self._upd_note.grid(row=1, column=0, columnspan=ncols, padx=(14, 4),
+                            pady=(0, 6), sticky="w")
+        close = ctk.CTkButton(pan, text="收起", command=self._toggle_updates,
+                              width=60, height=26, font=fs,
+                              fg_color="transparent", hover_color=C_BTN_HOV,
+                              text_color=C_DIM, corner_radius=6)
+        close.grid(row=0, column=ncols - 1, padx=(4, 12), pady=(6, 2),
+                   sticky="e")
+        pan.bind("<Configure>", self._reflow_upd_panel)
+        pan.grid_remove()                                 # 默认收起
+        return pan
+
+    def _reflow_upd_panel(self, ev=None):
+        """说明文字跟着抽屉宽度换行：一行或两行都排得下；再挤就收起文字。
+        按钮永远优先 —— 抽屉是内嵌的，宁可少一行说明也不裁控件（预留条目越多越需要）。"""
+        try:
+            avail = ((ev.width if ev is not None else self.upd_panel.winfo_width())
+                     or self.upd_panel.winfo_width()) - 34
+            if avail <= 0:
+                return                                  # 还没映射，等下一次 Configure
+            self._upd_note.configure(wraplength=max(200, avail))
+            if self._upd_note.winfo_reqheight() <= 46:  # 46px ≈ 两行 11 号字
+                self._upd_note.grid()
+            else:
+                self._upd_note.grid_remove()
+        except Exception:
+            pass
+
+    def _toggle_updates(self):
+        """展开/收起抽屉。首次展开时把三条说明打进日志（面板空间有限，细节看日志）。"""
+        if self.upd_panel.winfo_ismapped():
+            self.upd_panel.grid_remove()
+            self._upd_open = False
+            self.btn["updates"].configure(text="下载游戏资源与更新")
+            return
+        self.upd_panel.grid()
+        self._upd_open = True
+        self.btn["updates"].configure(text="收起资源与更新面板")
+        self.after(30, self._reflow_upd_panel)
+        if not self._upd_panel_told:
+            self._upd_panel_told = True
+            self.log_line("[*] ---- 下载游戏资源与更新 ----")
+            for _k, t, n, _c in self._update_panel_items():
+                self.log_line("[dbg] %s：%s" % (t, n))
+            self.log_line("[dbg] 资源层（cznlive 数据包）由游戏引擎自己下载，"
+                          "本启动器只检测与汇报；日志区就在上方，面板不会挡住它")
 
     # ---- 任务 2b: 全新安装（空目录 → 完整进游戏，方案 v1） ----
     def _on_install(self):
@@ -1362,6 +1467,7 @@ class App(ctk.CTk):
         # 权威路径：有登录态就静默续期拿 384 令牌走 DPMS API（无 token 恒 401，
         # 只能靠清单探测；全新目录无锚点时探测无法定界 —— 见 09-19 实测教训）
         token = self._game_token_quiet()
+        cl.set_stage("全新安装")          # 续期会抢占 stage，拿完令牌改回来
         if not token:
             self.log_line("[!] 未登录 —— 本机也没有官方安装版本可作探测锚点时，"
                           "全新安装将无法确定目标版本；建议先登录再装")
@@ -1372,7 +1478,8 @@ class App(ctk.CTk):
             self.log_line("    - %s：%s" % (e.rel, why))
         if r.ok:
             self.log_line("[*] 本体安装完成。接下来：登录 → 启动游戏 → "
-                          "首次运行时游戏会自行下载 ~19.9 GB 资源（本启动器只读汇报进度）")
+                          "首次运行时游戏会自行下载资源（cznlive 数据包，本机实测约 "
+                          "5.5 GB；本启动器只读汇报进度，不碰这些文件）")
             self.set_status("状态: 本体已安装，等待登录启动")
         else:
             self.set_status("状态: 全新安装失败（可重入，已下载部分会续传）")
@@ -1509,7 +1616,7 @@ class App(ctk.CTk):
             self.log_line("[dbg] 成功判据: %%LOCALAPPDATA%%\\STOVEPCSDK3\\logs\\"
                           "STOVE_CHAOSZERO\\BaseSDK_*.log 出现 Base_SetGameProfileCpp")
             self.set_status("状态: 游戏运行中 (管道保活中)")
-            # 首跑资源自建只读监控（全新安装场景的 19.9 GB 由游戏引擎自建；
+            # 首跑资源自建只读监控（全新安装场景的 cznlive 数据包由游戏引擎自建；
             # 已装好的环境无变化时监控静默自动收起）
             threading.Thread(target=self._first_run_monitor,
                              daemon=True).start()
