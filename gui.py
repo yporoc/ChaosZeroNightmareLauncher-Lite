@@ -1197,8 +1197,8 @@ class App(ctk.CTk):
 
     def _game_token_quiet(self):
         """静默拿游戏级令牌（有登录态才续期，没有立即返回 None，不弹任何 UI）。
-        DPMS live_version API 需要它作 Authorization（09-19 实测无 token 恒 401）。
-        10 分钟内复用已换取的令牌，避免一次操作里重复兑换（用户日志实测连兑两次）。"""
+        DPMS live_version API 需要它作 Authorization（实测无 token 恒 401）。
+        10 分钟内复用已换取的令牌，避免一次操作里重复兑换。"""
         if (getattr(self, "_launch_token", None)
                 and time.time() - getattr(self, "_token_ts", 0) < 600):
             return self._launch_token
@@ -1257,7 +1257,7 @@ class App(ctk.CTk):
         self.set_status("状态: 检查游戏本体版本…")
         token = self._game_token_quiet()
         # 静默续期过程会把 stage 改成「令牌续期/兑换游戏级令牌」，改回来 ——
-        # 否则下面 DPMS/CDN/入口 API 的日志全部挂错阶段（09-20 用户日志实测）
+        # 否则下面 DPMS/CDN/入口 API 的日志全部挂错阶段（实测）
         cl.set_stage("检查更新")
         info = upd.check(on_event=self.log_line, token=token)
         self.log_line("[*] ---- 游戏资源层（cznlive，由游戏引擎自己更新）----")
@@ -1398,7 +1398,7 @@ class App(ctk.CTk):
             self.log_line("[dbg] 资源层（cznlive 数据包）由游戏引擎自己下载，"
                           "本启动器只检测与汇报；日志区就在上方，面板不会挡住它")
 
-    # ---- 任务 2b: 全新安装（空目录 → 完整进游戏，方案 v1） ----
+    # ---- 任务 2b: 全新安装（空目录 → 完整进游戏） ----
     def _on_install(self):
         """主线程前置：目录选择 + 体检 + 征得同意（tkinter 对话框必须主线程），
         然后把重活交给工作线程 _task_install。"""
@@ -1465,7 +1465,7 @@ class App(ctk.CTk):
         if upd is None:
             return
         # 权威路径：有登录态就静默续期拿 384 令牌走 DPMS API（无 token 恒 401，
-        # 只能靠清单探测；全新目录无锚点时探测无法定界 —— 见 09-19 实测教训）
+        # 只能靠清单探测；全新目录无锚点时探测无法定界 —— 实测教训）
         token = self._game_token_quiet()
         cl.set_stage("全新安装")          # 续期会抢占 stage，拿完令牌改回来
         if not token:
@@ -1486,7 +1486,7 @@ class App(ctk.CTk):
 
     def _first_run_monitor(self):
         """首跑资源自建只读监控：游戏运行期间统计 cznlive 体积与账本组数，
-        有变化才打一行日志。零写入、零干预（方案 v1 §5 [自建] 环节）。"""
+        有变化才打一行日志。零写入、零干预。"""
         import glob as _glob
         import update as upd
         self.log_line("[首跑] 开始监控资源自建（只读，每 6s 采样）…")

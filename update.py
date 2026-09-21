@@ -322,7 +322,7 @@ def _registry_version():
 
     ⚠ 这是「这台机器装过官方游戏」的全局记录，不是某个目录的本地版本 ——
     全新安装到另一个目录时它只配当**探测锚点**（帮我们定位 CDN 上的当前
-    版本号），绝不能当成新目录的 local_version（09-19 用户实测踩坑：
+    版本号），绝不能当成新目录的 local_version（实测踩坑：
     注册表 54 泄漏进空目录，安装流程死路）。"""
     if os.name != "nt":
         return 0
@@ -495,7 +495,7 @@ def _probe_status(url, session):
     """探测单个 URL：返回 'ok' / '404' / 其它情况的说明文本。
 
     403/5xx 等瞬态错误重试 2 次 —— 实测同一 URL（v55）一分钟内会出现
-    403→404 漂移（2026-09-19 用户日志），单次采样会把瞬态 403 当成定论。"""
+    403→404 漂移（2026-09-19 实测），单次采样会把瞬态 403 当成定论。"""
     last = ""
     for attempt in (1, 2, 3):
         try:
@@ -1001,7 +1001,7 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 #   ② 资源 SSRA   <game>\bin\appdata\cznlive\     ~19.4 GB（占整个游戏的 98%）
 #                 由**游戏引擎自己在运行时**更新
 #
-# 生产协议（2026-09-19 MITM 抓包 + 重放实测，方案 v2 §7.1 已关闭）：
+# 生产协议（2026-09-19 MITM 抓包 + 重放实测，已定案）：
 #   入口  GET https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive
 #         ?platform=win32&appid=cznlive&build=<N>&lang=..&oslang=..
 #         &package=<market_game_id>&device_uid=..&publisher_uid=&buildx=<hex>
@@ -1274,7 +1274,7 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
     """只读：判断本地版本与最新版本。
 
     token          游戏级令牌（384 字符）——带上走 DPMS API 是权威路径
-                   （方案 v2 §3.1；09-19 实测无 token 恒 401）。
+                   （实测：无 token 恒 401）。
     ignore_registry=True 用于全新安装：本地版本只看目录内 .upf（应为 0），
                    机器级注册表版本降级为「探测锚点」。
     返回 dict：{local, live, need_update, manifest_url, probe_url, note}
@@ -1293,7 +1293,7 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
     log("[更新] 目录 %s" % root)
     log("[更新] 判定路径：%s" % ("权威 DPMS API（带 384 游戏级令牌）→ 拿不到版本才降级清单探测"
                               if token else
-                              "无登录令牌 ⇒ live_version API 必 401（09-19 实测），"
+                              "无登录令牌 ⇒ live_version API 必 401，"
                               "只能走清单探测兜底；探测不能定界时如实报「无法确认」"))
 
     upf = read_upf(root) or {}
@@ -1306,7 +1306,7 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
     def _dpms_call(local_ver):
         """调 DPMS live_version，返回 (live, project_file_url)。
 
-        响应结构注记（方案 v2 §3.1 标注 [推断]）：2026-09-19 用户实测证明
+        响应结构注记：2026-09-19 实测证明
         HTTP 200 + 游戏级令牌被接受，但 value 里没有推断中的 live_version
         （或 code≠0）——推断结构不成立。本函数因此做三件事：
           · code≠0 视为 API 错误并携带服务端消息（STOVE 惯例：HTTP 200 + 体内 code）
@@ -1464,7 +1464,7 @@ def update(root=None, session=None, on_event=None, cancel=None,
     force=True               忽略版本比较，直接用当前清单做一次全量比对（「修复」）。
     manifest_url=...         直接指定清单，跳过版本检查（排障 / 离线 / 自检用）。
     restore_modified=True    同版本时也把「与官方不同」的文件恢复成官方原版。
-    install=True             全新安装（方案 v1 §4-G4）：install_root 允许不存在
+    install=True             全新安装：install_root 允许不存在
                              （自动创建）；本地版本按 0 处理 → 计划=全量 20 文件。
                              资源层（cznlive）不由本流程处理 —— 首跑由游戏引擎自建。
 
@@ -2082,7 +2082,7 @@ def selftest():
             chk("更新不触碰资源层", before_app == snap_appdata(),
                 "%d 个资源文件" % len(before_app))
 
-            # ㉗b 全新安装模式：空目录 → 全量安装 + 账本（方案 v1 §4-G4）
+            # ㉗b 全新安装模式：空目录 → 全量安装 + 账本
             iroot = os.path.join(tmp, "fresh")
             os.makedirs(iroot, exist_ok=True)
             ri = update(iroot, manifest_url=used, install=True,
@@ -2097,7 +2097,7 @@ def selftest():
                 and all(cl.GAME_ID in t for t in tpls)
                 and tpls[0].endswith("_%d_v2.json"), tpls[0] if tpls else "-")
 
-            # ㉗c 全新安装版本判定 —— 09-19 用户实测三连 bug 的回归：
+            # ㉗c 全新安装版本判定 —— 三连 bug 的回归用例：
             #   ① 机器级注册表版本不得泄漏进全新目录（应按 0 处理）
             #   ② 探测「没有更新的版本」后，当前版本的清单必须落地为 manifest_url
             #   ③ 全新目录以机器注册表版本为探测锚点（仅锚点，非本地版本）
@@ -2147,7 +2147,7 @@ def selftest():
             finally:
                 globals()["_registry_version"] = orig_reg
 
-            # ㉗e DPMS API 响应三态（09-19 用户实测：200+令牌被接受但无 live_version）：
+            # ㉗e DPMS API 响应三态（实测：200 + 令牌被接受但响应无 live_version）：
             #   ① 200+value 正常 → 直接用；② 200+code≠0 → 报错并降级探测；
             #   ③ 200 但无 live_version → 记录原文并降级探测（锚点兜底）
             def _check_with_api_body(body):

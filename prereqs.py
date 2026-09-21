@@ -3,7 +3,7 @@
 # CZN Launcher Lite —— 环境前置体检与安装（全新安装）
 # Copyright (C) 2026 CZN Launcher Lite contributors
 # GNU General Public License v3.0
-r"""环境前置体检与安装（全新安装方案 v1 §4-G2/G3）。
+r"""环境前置体检与安装（全新安装）。
 
 覆盖从 0 环境真正缺的三样东西：
   · 磁盘空间（本体 269 MB + 首跑资源数据包，实测约 5.5 GB）

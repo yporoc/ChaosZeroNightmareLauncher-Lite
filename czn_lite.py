@@ -1667,7 +1667,7 @@ class StoveAuth:
         }
         token = self.launcher_access or self.game_access_token
         # 没有任何令牌时**不发** Authorization 头 —— 发 "bearer None" 是假凭据，
-        # 既污染日志（09-20 用户日志实测）又可能被服务端按异常请求记账
+        # 既污染日志又可能被服务端按异常请求记账
         auth = {"Authorization": "bearer " + str(token)} if token else {}
         print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
               % self.session_tid)
@@ -1683,7 +1683,7 @@ class StoveAuth:
         except Exception:
             data = None
         # 70702 = 服务端拒绝 Caller-Detail（全新环境指纹缺失/失效）：
-        # 轮换安装指纹后原样重试一次（方案 v1 §4-G1 自愈路径）
+        # 轮换安装指纹后原样重试一次（自愈路径）
         if isinstance(data, dict) and str(data.get("code")) == "70702":
             if _rotate_caller_detail():
                 headers = self._official_headers({
