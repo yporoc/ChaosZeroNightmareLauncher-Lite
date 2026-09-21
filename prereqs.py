@@ -25,7 +25,7 @@ import urllib.request
 # 微软官方固定链接（永久重定向，非第三方镜像）
 VC_REDIST_X64_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 WEBVIEW2_BOOTSTRAP_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-_UA = "czn-lite/0.0.3"
+_UA = "czn-lite/0.0.4"
 
 # WebView2 Evergreen 运行时的注册表位置（微软官方检测方式）
 _WEBVIEW2_KEYS = (
