@@ -518,12 +518,10 @@ def probe_latest_version(manifest_url_tpl, start, session=None, limit=PROBE_MAX_
                          sanity_version=0, on_event=None):
     """免鉴权兜底：从 start 起递增探测清单，返回 (最新版本, 错误说明)。
 
-    语义（证据：同一 CDN 对「不存在的版本」昨天回 404、今天回 403 —— 返回码漂移）：
-      · 模板可以是 v1/v2 两种形态的列表，任一形态 200 即视为该版本存在；
-      · 所有形态都 404 才算「到达边界」（确定没有更新的版本）；
-      · 先探测 sanity_version（=本地当前版本）做通道自检：连当前版本的清单
-        都拿不到 ⇒ 探测通道不可信，如实报错 —— 绝不能把 403/网络错误悄悄
-        当成「没有更新」。
+    实测同一 CDN 对「不存在的版本」会随出口返回 404 或 403，所以：
+      · v1/v2 任一形态 200 即视为存在；全部 404 才算到达边界；
+      · 先用 sanity_version（本地当前版本）自检通道 —— 连它都拿不到就判定
+        通道不可信并报错，绝不把 403 当成「没有更新」。
     """
     log = on_event or (lambda m: None)
     tpls = list(manifest_url_tpl) if isinstance(manifest_url_tpl, (list, tuple)) \
@@ -993,35 +991,24 @@ def apply_plan(root: str, manifest: Manifest, plan: Plan, manifest_url: str,
 
 
 # ====================================================================
-# 游戏资源层（SSRA / cznlive）—— 识别、检测、报告；不下载、不替换
+# 游戏资源层（cznlive / SSRA）—— 只识别、检测、报告；不下载、不替换
 # --------------------------------------------------------------------
-# 游戏由两部分组成，更新通道**完全独立**：
-#   ① 本体 DPMS   <game>\bin\*.dll|*.exe          20 个受管文件  269 MB
-#                 由官方 STOVE 启动器（InstallLib）负责 → 本模块负责
-#   ② 资源 SSRA   <game>\bin\appdata\cznlive\     ~19.4 GB（占整个游戏的 98%）
-#                 由**游戏引擎自己在运行时**更新
+# 两条更新通道完全独立（实测：本体 269 MB；资源 5.5 GB 数据包 + 2.8 GB 展开副本）：
+#   ① 本体 DPMS  bin\ 下 20 个受管文件 —— 官方由 STOVE 启动器负责 → 本模块负责
+#   ② 资源 SSRA  bin\appdata\cznlive  —— 由游戏引擎在运行时自己更新
 #
-# 生产协议（2026-09-19 MITM 抓包 + 重放实测，已定案）：
+# 生产协议（实抓 + 重放定案）：
 #   入口  GET https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive
-#         ?platform=win32&appid=cznlive&build=<N>&lang=..&oslang=..
-#         &package=<market_game_id>&device_uid=..&publisher_uid=&buildx=<hex>
-#         —— 零鉴权；X-App-Id/X-App-NS 可省；build 参数容错；
-#            响应间唯一差异是 _entry_timestamp（nonce）
-#   配置  响应即游戏的世界/版本配置（= 生产 verinfo）：
-#           cdn.url = https://czn-live-down.game.playstove.com/patch/1.0.46407/WLOP8Q5CZ9HW/
-#           cdn.version.policies = "res,media,text"
-#           cdn.version_res/media/text.current = 688 / 227 / 688
-#           cdn.context = "$(remote.res.version)/$(remote.res.version)-$(local.res.version).tar.lz4"
-#           app.api（wss 游戏套接字）、title_movie_cdn、build.version=464
-#   比对  引擎实际比对的「本地组修订号」在 data.indices/<组>.pigz 尾部：
-#           8 字节 `@ver` + u32（实测 res=688 / media=227 / text=688，
-#           与远端逐组一致 ⇒ 无更新；pcrevs 文件名里的 text_ko=685 /
-#           text_zht=687 是语言子层修订，不是组级修订）
+#         ?platform=win32&appid=cznlive&build=<N>&lang=..&oslang=..&package=..
+#         &device_uid=..&publisher_uid=&buildx=<hex>
+#         零鉴权；X-App-Id / X-App-NS 可省；build 参数容错
+#   响应  cdn.url、cdn.version.policies、cdn.version_<组>.current、
+#         cdn.context（增量包名模板）、app.api、build.version
+#   比对  本地组修订在 data.indices/<组>.pigz 尾部的 `@ver` + u32；
+#         pcrevs 文件名里的编号是语言子层修订，不是组级
 #
-# 本模块对资源层**只做识别、检测、如实报告，绝不下载或替换**：
-#   · 19.4 GB，写坏代价极高；增量包（tar.lz4）的落地与校验由游戏引擎完成
-#   · data.pack 是加密的、*.pigz 是 PLPcK、pcrevs 是二进制 —— 都是游戏私有格式
-#   · 官方启动器同样不碰它；游戏引擎自己会更新
+# 不写回：卷是加密私有格式，要与索引、账本三方一致才过得了游戏自校验 ——
+# 收益为零，错一个子组的代价却是整卷重下。官方启动器同样不碰这一层。
 # ====================================================================
 GAMEDATA_REL = os.path.join("bin", "appdata", "cznlive")
 # 入口 API 与默认参数（均为 2026-09-19 实测值；可在 config.json 覆盖）
@@ -1115,13 +1102,9 @@ def log_gamedata_local(root=None, on_event=None) -> dict:
 def read_index_versions(root=None) -> dict:
     """各组资源的「本地补丁修订号」—— 引擎实际用来比对的那个数。
 
-    证据（2026-09-19 实测解包）：data.indices/<组>.pigz（gzip 的 PLPcK 索引）
-    末尾 8 字节是 `@ver` + u32 修订号：
-      text.pigz → 688 == 远端 cdn.version_text.current=688
-      media.pigz → 227 == 远端 cdn.version_media.current=227
-      res.pigz  → 688 == 远端 cdn.version_res.current=688
-    （pcrevs 文件名里的 text_ko=685 / text_zht=687 是**语言子层**修订，
-    不是引擎比对的组级修订 —— 组级修订在索引 @ver 里。）
+    实测：data.indices/<组>.pigz（gzip 的 PLPcK 索引）末尾是 `@ver` + u32，
+    逐组等于远端 cdn.version_<组>.current。pcrevs 文件名里的编号是语言子层
+    修订，不是组级修订。
     """
     d = os.path.join(gamedata_dir(root), "data.indices")
     out = {}
@@ -1145,14 +1128,11 @@ def read_index_versions(root=None) -> dict:
 
 
 def fetch_world_config(session=None, on_event=None, entry_url=None) -> dict:
-    """拉游戏的入口/版本配置（生产 verinfo，2026-09-19 抓包 + 重放实测）。
+    """拉游戏的入口/版本配置（生产 verinfo）。
 
-    请求形态（照抄游戏原样，参数服务端不校验）：
-      GET <entry>?platform=win32&appid=<appid>&build=<build>&lang=..&oslang=..
-         &package=<market_game_id>&device_uid=<uuid>&publisher_uid=&buildx=<hex>
-    实测：零鉴权；缺 X-App-Id/X-App-NS 头也 200；build=400 一样返回当前配置。
-    返回 world.<world>.<branch> 节点（cdn.url / cdn.version_*.current /
-    app.api / build.version / title_movie_cdn …）。
+    请求形态照抄游戏原样，服务端不校验参数：实测零鉴权，缺 X-App-Id/X-App-NS
+    也返回 200，build 传错值同样给当前配置。返回 world.<world>.<branch> 节点
+    （cdn.url、cdn.version_*.current、app.api、build.version、title_movie_cdn）。
     """
     log = on_event or (lambda m: None)
     base = (entry_url or _u_str("gameres_entry_url", GAMERES_ENTRY_DEFAULT)).rstrip("/")
@@ -1184,11 +1164,9 @@ def fetch_world_config(session=None, on_event=None, entry_url=None) -> dict:
 def check_gamedata(root=None, session=None, on_event=None, entry_url=None):
     """识别并检测资源层（只读；**不下载、不替换**）。
 
-    P1（2026-09-19 生产协议取证后）：逐组比对
-      本地  data.indices/<组>.pigz 尾部 @ver 修订号（引擎实际比对的值）
-      远端  入口 API world.<world>.<branch> 的 cdn.version_<组>.current
-      增量  cdn.context 模板 $(remote)/$(remote)-$(local).tar.lz4（cdn.url 下）
-    远端不可达时如实报告，不影响启动；增量包由游戏引擎运行时自取。
+    逐组比对：本地 = data.indices/<组>.pigz 尾部 @ver；远端 = 入口配置的
+    cdn.version_<组>.current；增量包名按 cdn.context 模板推导（cdn.url 下）。
+    远端不可达时如实报告，不影响启动；增量包的落地由游戏引擎自己完成。
     """
     log = on_event or (lambda m: None)
     root = _root(root)
@@ -1306,12 +1284,9 @@ def check(root=None, session=None, on_event=None, allow_probe=None,
     def _dpms_call(local_ver):
         """调 DPMS live_version，返回 (live, project_file_url)。
 
-        响应结构注记：2026-09-19 实测证明
-        HTTP 200 + 游戏级令牌被接受，但 value 里没有推断中的 live_version
-        （或 code≠0）——推断结构不成立。本函数因此做三件事：
-          · code≠0 视为 API 错误并携带服务端消息（STOVE 惯例：HTTP 200 + 体内 code）
-          · 200 但取不到 live_version 时**把响应原文打进日志**（一次重测定案）
-          · 由调用方决定是否降级到探测兜底（绝不信任 live=0 的 200）
+        实测：HTTP 200 且令牌被接受时，响应体并不保证含 live_version，
+        所以这里三件事：code≠0 当错误并带上服务端消息；取不到版本号就把
+        响应原文打进日志；由调用方决定是否降级探测 —— 绝不信任 live=0 的 200。
         """
         api = ("%s/dpms/game/v3.1/live_version?game_id=%s&local_version=%d&pc_room=false"
                % (cl.API, cl.GAME_ID, local_ver))
@@ -1457,23 +1432,17 @@ def update(root=None, session=None, on_event=None, cancel=None,
            workers=None, resume=None, backup=None, dry_run=False,
            on_progress=None, force=False, manifest_url=None,
            restore_modified=None, install=False, token=None):
-    """完整流程：检查 → 计划 → 执行。
+    """完整流程：检查 → 计划 → 执行。参数为 None 时取 config.json 的 update 段。
 
-    参数为 None 时从 config.json 的 update 段取默认值。
+    force=True             忽略版本比较，按当前清单全量比对一次（「修复」用）
+    manifest_url=...       直接指定清单，跳过版本检查（排障 / 离线 / 自检）
+    restore_modified=True  同版本时也把「与官方不同」的文件恢复成官方原版
+    install=True           全新安装：目录可不存在（自动创建），本地版本按 0 处理，
+                           计划即全量受管文件；资源层仍由游戏首跑自建
 
-    force=True               忽略版本比较，直接用当前清单做一次全量比对（「修复」）。
-    manifest_url=...         直接指定清单，跳过版本检查（排障 / 离线 / 自检用）。
-    restore_modified=True    同版本时也把「与官方不同」的文件恢复成官方原版。
-    install=True             全新安装：install_root 允许不存在
-                             （自动创建）；本地版本按 0 处理 → 计划=全量 20 文件。
-                             资源层（cznlive）不由本流程处理 —— 首跑由游戏引擎自建。
-
-    关于「与官方不同」的文件：
-      · 大更新（版本号变了）→ 一律按官方清单替换，包括被补丁/汉化改过的游戏主程序；
-        日志会逐个点名，并提示更新后需要重新补丁与汉化。
-      · 同版本（只是校验/修复）→ 默认**保留不动**：那些文件通常就是补丁与汉化，
-        不能当成损坏去「修」，否则会误杀。
-      · 热更（bin\\appdata\\cznlive）由游戏自己管，两种情况下都不碰，因此热补丁后无需重新补丁。
+    「与官方不同」的文件（大小一致、MD5 不同）通常是补丁或汉化：
+    大版本一律按官方清单覆盖（日志逐个点名，之后需重新打补丁）；
+    同版本默认保留不动 —— 当成损坏去「修」就会误杀。
     """
     log = on_event or (lambda m: None)
     root = _root(root)
