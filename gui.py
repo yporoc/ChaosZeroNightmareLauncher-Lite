@@ -1217,38 +1217,6 @@ class App(ctk.CTk):
             self.log_line("[!] 静默续期失败（将以清单探测兜底）：%s" % exc)
         return None
 
-    def _maybe_update(self):
-        """启动流程里的更新检查。返回 True 表示可以继续启动。"""
-        upd = self._upd()
-        if upd is None:
-            return True
-        if not cl.INSTALL_ROOT or not os.path.isdir(cl.INSTALL_ROOT):
-            self.log_line("[!] 未配置游戏目录，跳过更新检查")
-            return True
-        # 资源层（cznlive）由游戏引擎自己在运行时更新，这里只报本地概况，不联网
-        upd.log_gamedata_local(cl.INSTALL_ROOT, self.log_line)
-        self.set_status("状态: 检查游戏本体版本…")
-        info = upd.check(on_event=self.log_line,
-                         token=getattr(self, "_launch_token", None))
-        if info.get("error"):
-            self.log_line("[!] %s" % info["error"])
-            return True
-        if not info["need_update"]:
-            if info.get("determined"):
-                self.log_line("[+] 游戏本体已是最新（%d）" % info["local"])
-            else:
-                self.log_line("[!] 无法确认最新版本（%s）—— 已跳过更新检查"
-                              % (info.get("probe_error") or "版本接口不可用"))
-            return True
-        self.log_line("[!] 游戏本体有新版本 %d（本地 %d）"
-                      % (info["live"], info["local"]))
-        if not cl._cfg_bool("update", "auto_download", default=False):
-            if not self._ask_update(info["live"], info["local"]):
-                self.log_line("[*] 已跳过更新（可稍后点「检查更新」）")
-                return True
-        self._do_update(upd)
-        return True
-
     def _task_check_update(self):
         cl.set_stage("检查更新")
         upd = self._upd()
@@ -1276,7 +1244,9 @@ class App(ctk.CTk):
                 self.set_status("状态: 无法确认版本")
             return
         self.log_line("[!] 发现新版本 %d（本地 %d）" % (info["live"], info["local"]))
-        if self._ask_update(info["live"], info["local"]):
+        # auto_download=true 时不再弹确认，直接下；默认仍然问一句
+        if cl._cfg_bool("update", "auto_download", default=False) or self._ask_update(
+                info["live"], info["local"]):
             self._do_update(upd)
         else:
             self.set_status("状态: 已跳过更新")
@@ -1578,11 +1548,7 @@ class App(ctk.CTk):
         auth.import_member_fields_from_official_log()
         auth.save()
 
-        # 游戏本体更新：在拉起之前做完自己能做的（可关：config.json 的 update.check_on_launch）
-        if cl._cfg_bool("update", "check_on_launch", default=True):
-            self._maybe_update()
-            if self._cancel.is_set():
-                return
+        # 启动流程不碰更新：检查与下载一律由底栏「下载游戏资源与更新」手动触发
 
         required = cl.build_required_info(auth)
         cl.validate_required_info(required)
