@@ -64,6 +64,14 @@ from Crypto.PublicKey import RSA
 _APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) \
     else Path(__file__).parent
 
+# Windows 下 stdout 被重定向时按 GBK 编码，日志里的 ⇒ ✓ ⚠ 这类字符会抛
+# UnicodeEncodeError。只放宽错误处理（编不了的替换成 ?），不让打日志弄死流程。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 
 def _find_config_file():
     candidates = []
