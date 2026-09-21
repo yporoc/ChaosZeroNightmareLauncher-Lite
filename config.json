@@ -54,5 +54,25 @@
   "file_max_mb": 8,
   "include_env_snapshot": true,
   "timestamp_ms": true
+ },
+ "update": {
+  "check_on_launch": true,
+  "auto_download": false,
+  "verify_mode": "full",
+  "workers": 4,
+  "resume": true,
+  "backup_before_replace": true,
+  "restore_modified": false,
+  "keep_temp": false,
+  "probe_fallback": true,
+  "check_vcredist": true,
+  "buildinfo_check": true,
+  "dpms_manifest_url_base": "http://chaoszero-dl.game.onstove.com/game/dpms_STOVE_CHAOSZERO",
+  "gameres_entry_url": "https://live-czn-entry2lx2fz.game.playstove.com:13001/cznlive",
+  "gameres_appid": "cznlive",
+  "gameres_ns": "ssr-base-260909",
+  "gameres_build": 464,
+  "gameres_world": "asia",
+  "gameres_branch": "live"
  }
 }

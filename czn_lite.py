@@ -978,6 +978,44 @@ def _caller_detail():
         return None
 
 
+def _ensure_caller_detail():
+    """拿到 CallerDetail；全新环境（从未装过官方 STOVE）没有就生成并写回。
+
+    依据《从0环境完整进游戏_全新安装方案_v1》§4-G1：官方 STOVESetup 会在
+    HKCU\\SOFTWARE\\SGUP 写 40-hex 安装指纹，我们模仿同款行为（值格式对齐
+    4a54eb8fe96aa7644aae18adc4bd5dcfd2ae9f7b）。服务端是否校验指纹值未验证，
+    故另有 70702 自愈重试（StoveAuth.game_check 内）。"""
+    value = _caller_detail()
+    if value:
+        return value
+    import secrets
+    value = secrets.token_hex(20)
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\SGUP",
+                                 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "CallerDetail", 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        print("[*] 全新环境：已生成并写入 CallerDetail 安装指纹")
+    except Exception as exc:
+        print("[!] CallerDetail 写注册表失败（本次请求仍携带生成值）：%s" % exc)
+    return value
+
+
+def _rotate_caller_detail():
+    """强制换新 CallerDetail 并写回注册表（gc/check 70702 自愈重试用）。"""
+    import secrets
+    value = secrets.token_hex(20)
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\SGUP",
+                                 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "CallerDetail", 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        print("[*] CallerDetail 已轮换（自愈重试）")
+    except Exception as exc:
+        print("[!] CallerDetail 轮换写注册表失败：%s" % exc)
+    return value
+
+
 def machine_guid():
     """读取注册表 HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid。
     仅用于诊断输出；官方 signin 请求体经抓包确认不含 device_id。"""
@@ -1367,7 +1405,7 @@ class StoveAuth:
             "X-Timezone": self.gds.get("timezone", "Asia/Tokyo"),
             "X-Utc-Offset": str(int(self.gds.get("utc_offset", 540))),
         }
-        caller_detail = _caller_detail()
+        caller_detail = _ensure_caller_detail()
         if caller_detail:
             headers["Caller-Detail"] = caller_detail
         headers["Transaction-ID"] = self.session_tid
@@ -1628,19 +1666,38 @@ class StoveAuth:
             "skip_session_check": bool(skip_session),
         }
         token = self.launcher_access or self.game_access_token
+        # 没有任何令牌时**不发** Authorization 头 —— 发 "bearer None" 是假凭据，
+        # 既污染日志又可能被服务端按异常请求记账
+        auth = {"Authorization": "bearer " + str(token)} if token else {}
+        print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
+              % self.session_tid)
         headers = self._official_headers({
-            "Authorization": "bearer " + str(token),
+            **auth,
             "market-name": "PC_MARKET",
             "Captcha-Token": "",
         })
-        print("[dbg][gc/check] Transaction-ID = device_key = %s（会话级同值）"
-              % self.session_tid)
         r = self.s.post(API_BASE + "/gc/v1.4/check/" + GAME_ID, json=body,
                         headers=headers, timeout=20)
         try:
-            return r.status_code, r.json(), r.text
+            data = r.json()
         except Exception:
-            return r.status_code, None, r.text
+            data = None
+        # 70702 = 服务端拒绝 Caller-Detail（全新环境指纹缺失/失效）：
+        # 轮换安装指纹后原样重试一次（自愈路径）
+        if isinstance(data, dict) and str(data.get("code")) == "70702":
+            if _rotate_caller_detail():
+                headers = self._official_headers({
+                    **auth,
+                    "market-name": "PC_MARKET",
+                    "Captcha-Token": "",
+                })
+                r = self.s.post(API_BASE + "/gc/v1.4/check/" + GAME_ID, json=body,
+                                headers=headers, timeout=20)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = None
+        return r.status_code, data, r.text
 
     def game_token(self):
         """兑换游戏级令牌（两步，缺第二步必报 41002）：
@@ -2469,6 +2526,36 @@ def dry_run():
     print("=== DRY RUN PASS ===")
 
 
+def _game_update(args):
+    """游戏本体更新（DPMS）：在拉起游戏之前完成。
+
+    只处理 <install_root>\\bin 下的受管文件（清单里的 F 条目）。
+    资源热更（bin\\appdata\\cznlive）由游戏引擎自己完成，这里绝不触碰。
+    """
+    try:
+        import update as upd
+    except Exception as e:
+        print("[!] 更新模块不可用（%s），跳过更新" % e)
+        return
+
+    if args.verify_files:
+        r = upd.verify(on_event=print)
+        print("[%s] %s" % ("+" if r.ok else "!", r.message))
+        return
+
+    if not args.update and not _cfg_bool("update", "auto_download", default=False):
+        info = upd.check(on_event=print)
+        if info.get("error"):
+            print("[!] %s" % info["error"])
+        elif info.get("need_update"):
+            print("[!] 游戏本体有新版本 %d（本地 %d）—— 加 --update 执行，"
+                  "或在界面点「检查更新」" % (info["live"], info["local"]))
+        return
+
+    r = upd.update(on_event=print)
+    print("[%s] %s" % ("+" if r.ok else "x", r.message))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="czn-lite 控制台版（与 GUI 共用同一套核心逻辑）")
@@ -2484,6 +2571,10 @@ def main():
                         help="显式指定 REQUIRED_INFO 的 guid（默认自动导入）")
     parser.add_argument("--capture-stdout", action="store_true",
                         help="诊断：重定向游戏进程 stdout 到文件")
+    parser.add_argument("--update", action="store_true",
+                        help="启动前检查并执行游戏本体更新（DPMS）")
+    parser.add_argument("--verify-files", action="store_true",
+                        help="只做游戏本体完整性校验，不下载任何东西")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -2543,6 +2634,11 @@ def main():
     auth.resolve_guid(explicit=args.guid)
     auth.import_member_fields_from_official_log()
     auth.save()
+
+    # 游戏本体更新：在拉起之前做完自己能做的（可关：config.json 的 update.check_on_launch）
+    if not args.offline and (args.update or args.verify_files
+                             or _cfg_bool("update", "check_on_launch", default=True)):
+        _game_update(args)
 
     required = build_required_info(auth)
     validate_required_info(required)
