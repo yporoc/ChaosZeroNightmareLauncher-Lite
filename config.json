@@ -56,7 +56,6 @@
   "timestamp_ms": true
  },
  "update": {
-  "check_on_launch": true,
   "auto_download": false,
   "verify_mode": "full",
   "workers": 4,

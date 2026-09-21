@@ -2176,7 +2176,7 @@ def selftest():
                 str(i3["live"]))
 
             # ㉗ 配置项必须真的被读到（防止「声明了没接上」）
-            keys = ("check_on_launch", "auto_download", "verify_mode", "workers",
+            keys = ("auto_download", "verify_mode", "workers",
                     "resume", "backup_before_replace", "restore_modified",
                     "keep_temp", "probe_fallback", "check_vcredist",
                     "buildinfo_check", "dpms_manifest_url_base",
