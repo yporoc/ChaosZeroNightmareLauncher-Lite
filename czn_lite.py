@@ -310,6 +310,9 @@ class Route:
 
 
 _DIRECT = {"all": ""}
+# 系统代理判定的缓存秒数：过期后重判（判定结果没变就静默续期）。
+# 用户中途在系统里开/关代理，最多 TTL 秒后被看见。
+_SYSTEM_ROUTE_TTL = 30.0
 _NET_CACHE = {}
 _NET_LOCK = threading.Lock()
 _STAGE = {"name": "启动"}
@@ -529,6 +532,9 @@ def resolve_route(url):
     """解析一次请求的网络路径：手动 > 按域名覆盖 > 系统代理 > 默认直连。
 
     结果按 (模式, host, 覆盖项) 缓存 —— 因为 PAC 是 per-URL 的。
+    系统代理模式的判定有 TTL：用户可能中途在系统里开/关代理，
+    永久缓存会让「判定那一刻没开代理」变成永远直连。过期重判时
+    若结论没变就静默续期（不刷日志），变了才记一条变化事件。
     """
     host = _host_of(url)
     override = None
@@ -542,10 +548,16 @@ def resolve_route(url):
                     break
 
     cache_key = (NET_MODE, host, str(override))
+    now = time.time()
     with _NET_LOCK:
-        hit = _NET_CACHE.get(cache_key)
-    if hit is not None:
-        return hit
+        cached = _NET_CACHE.get(cache_key)
+    if cached is not None:
+        cached_ts, cached_route = cached
+        if NET_MODE != "system" or now - cached_ts <= _SYSTEM_ROUTE_TTL:
+            return cached_route
+        stale = cached_route
+    else:
+        stale = None
 
     if override is not None:
         text = str(override).strip()
@@ -569,8 +581,18 @@ def resolve_route(url):
         route = Route(_DIRECT, "默认直连", "network.mode=%s" % NET_MODE, host)
 
     with _NET_LOCK:
-        _NET_CACHE[cache_key] = route
-    if NET_LOG_DECISIONS:
+        _NET_CACHE[cache_key] = (now, route)
+
+    changed = (stale is not None and
+               (stale.source, stale.proxies.get("all"))
+               != (route.source, route.proxies.get("all")))
+    if changed and NET_LOG_DECISIONS:
+        record("route", stage=stage(), host=host, source=route.source,
+               proxy=(route.proxies.get("all") or "直连"),
+               detail="系统代理判定变化: %s → %s"
+                      % (stale.proxies.get("all") or "直连",
+                         route.proxies.get("all") or "直连"))
+    elif stale is None and NET_LOG_DECISIONS:
         record("route", stage=stage(), host=host, source=route.source,
                proxy=(route.proxies.get("all") or "直连"), detail=route.detail)
     return route
@@ -1971,6 +1993,9 @@ class PipeServer(threading.Thread):
         self.handshake_done = threading.Event()
         self.frames = []
         self._pipe_handle = None
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
+        self._pipe_dup = None            # 看门狗专用的句柄副本
 
     def run(self):
         self.serve()
@@ -1989,6 +2014,7 @@ class PipeServer(threading.Thread):
             | win32pipe.PIPE_WAIT,
             255, 65536, 65536, 5000, security)
         self._pipe_handle = handle
+        self._pipe_dup = self._dup_handle(handle)
         print("[pipesrv] 监听 %s" % PIPE_NAME)
         while self.running:
             try:
@@ -2012,8 +2038,11 @@ class PipeServer(threading.Thread):
             except Exception as e:
                 print("[pipesrv] 会话异常：%s" % e)
             try:
+                # 先复位状态再断开：Disconnect 偶发失败也不能让 GUI
+                # 卡在「游戏运行中」
+                self.handshake_done.clear()
+                self.game_pid = None
                 win32pipe.DisconnectNamedPipe(handle)
-                self.handshake_done.clear()  # 会话结束，GUI 按钮回落
             except Exception:
                 pass
         try:
@@ -2021,6 +2050,70 @@ class PipeServer(threading.Thread):
         except Exception:
             pass
         self._pipe_handle = None
+
+    @staticmethod
+    def _pid_alive(pid):
+        """进程是否仍在运行（PROCESS_QUERY_LIMITED_INFORMATION 即可，
+        无需额外依赖）。打不开 = 已退出；查询失败按活着处理（不误杀）。"""
+        try:
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return code.value == 259          # STILL_ACTIVE
+                return True
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return True
+
+    def _dup_handle(self, handle):
+        """给看门狗复制一份管道句柄（持有同一管道对象的独立引用：
+        即使服务线程先关闭原句柄，副本仍然有效，不存在句柄值复用
+        被误解的竞态）。"""
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.DuplicateHandle.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            dup = ctypes.c_void_p()
+            cur = k32.GetCurrentProcess()
+            ok = k32.DuplicateHandle(cur, ctypes.c_void_p(int(handle)), cur,
+                                     ctypes.byref(dup), 0, False, 2)
+            return dup.value if ok else None    # 2 = DUPLICATE_SAME_ACCESS
+        except Exception:
+            return None
+
+    def _watch_game_pid(self):
+        """游戏进程看门狗：游戏退出后其管道句柄可能被残留进程（SDK
+        助手/盾进程等）持有，服务端 ReadFile 永远等不到 broken pipe，
+        会话就一直挂着（GUI 卡在「游戏运行中」）。握手 1000 里游戏上报
+        了自己的 pid，每 3 秒探活一次；进程消失后只做两件事——复位
+        状态、对自家句柄副本 CancelIoEx 取消挂起读取。断开与关闭由
+        服务线程在自己的原始句柄上完成，看门狗不碰别人线程的句柄。"""
+        while not self._watchdog_stop.wait(3):
+            pid = self.game_pid
+            if not pid:
+                return                              # 会话已结束，看门狗收工
+            if not self._pid_alive(int(pid)):
+                print("[pipesrv] 游戏进程 %s 已退出，取消挂起读取以结束会话" % pid)
+                record("pipe", event="游戏进程退出，结束管道会话", pid=pid)
+                # 状态先行复位：后续任何失败都不影响 GUI 回落
+                self.handshake_done.clear()
+                self.game_pid = None
+                try:
+                    if self._pipe_dup is not None:
+                        k32 = ctypes.windll.kernel32
+                        k32.CancelIoEx.argtypes = [ctypes.c_void_p,
+                                                   ctypes.c_void_p]
+                        k32.CancelIoEx(ctypes.c_void_p(self._pipe_dup), None)
+                except Exception:
+                    pass
+                return
 
     def stop(self):
         """停止服务：置位 running 并唤醒阻塞中的 ConnectNamedPipe。
@@ -2031,6 +2124,17 @@ class PipeServer(threading.Thread):
         ConnectNamedPipe 返回，服务线程发现 running=False 后干净退出
         并释放管道名。"""
         self.running = False
+        self._watchdog_stop.set()            # 看门狗立即退出
+        t = self._watchdog_thread
+        if t and t.is_alive():
+            t.join(4)                        # 等它收尾，再关句柄副本
+        try:
+            if self._pipe_dup is not None:
+                ctypes.windll.kernel32.CloseHandle(
+                    ctypes.c_void_p(self._pipe_dup))
+        except Exception:
+            pass
+        self._pipe_dup = None
 
         def _wake():
             try:
@@ -2129,6 +2233,12 @@ class PipeServer(threading.Thread):
         self._write_frame(handle, 2001,
                           self._envelope(0, "Success", encrypted.hex().upper()))
         self.handshake_done.set()
+        # 看门狗：游戏退出但句柄被残留进程持有时强制收尾（防 GUI 卡运行中）
+        t = self._watchdog_thread
+        if not (t and t.is_alive()):
+            self._watchdog_thread = threading.Thread(
+                target=self._watch_game_pid, daemon=True, name="pipesrv-watchdog")
+            self._watchdog_thread.start()
         print("[pipesrv] 握手完成（2000/2001 已推送）")
 
 
@@ -2534,26 +2644,6 @@ def dry_run():
     print("=== DRY RUN PASS ===")
 
 
-def _game_update(args):
-    """游戏本体更新（DPMS）：仅在显式 --update / --verify-files 时执行，启动流程不调。
-
-    只处理 <install_root>\\bin 下的受管文件（清单里的 F 条目）。
-    资源热更（bin\\appdata\\cznlive）由游戏引擎自己完成，这里绝不触碰。
-    """
-    try:
-        import update as upd
-    except Exception as e:
-        print("[!] 更新模块不可用（%s），跳过更新" % e)
-        return
-
-    if args.verify_files:
-        r = upd.verify(on_event=print)
-        print("[%s] %s" % ("+" if r.ok else "!", r.message))
-        return
-
-    r = upd.update(on_event=print)
-    print("[%s] %s" % ("+" if r.ok else "x", r.message))
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2570,10 +2660,6 @@ def main():
                         help="显式指定 REQUIRED_INFO 的 guid（默认自动导入）")
     parser.add_argument("--capture-stdout", action="store_true",
                         help="诊断：重定向游戏进程 stdout 到文件")
-    parser.add_argument("--update", action="store_true",
-                        help="检查并执行游戏本体更新（DPMS）；不带动作时启动流程不碰更新")
-    parser.add_argument("--verify-files", action="store_true",
-                        help="只做游戏本体完整性校验，不下载任何东西")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -2635,9 +2721,6 @@ def main():
     auth.save()
 
     # 启动流程不碰更新：只有显式 --update / --verify-files 才执行
-    if args.update or args.verify_files:
-        _game_update(args)
-
     required = build_required_info(auth)
     validate_required_info(required)
     print("[*] REQUIRED_INFO 自检通过（%d 字段）" % len(required))

@@ -20,5 +20,6 @@ build/
 dist/
 dist_new/
 
-# PyInstaller spec 可由 build.bat 重新生成
+# PyInstaller spec 可由 build_flet.bat 重新生成
 czn-lite-gui.spec
+czn-lite-flet.spec
