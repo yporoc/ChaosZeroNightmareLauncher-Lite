@@ -5,10 +5,11 @@
 #
 # 用法：
 #   pip install -r requirements.txt
-#   python gui.py         # 图形界面
+#   python gui_flet.py    # 图形界面（Flet / Material 3，主推）
+#   python gui.py         # 图形界面（customtkinter 旧版，保留兜底）
 #   python czn_lite.py    # 控制台版（同等功能）
 #
-# 注意：打包工具 PyInstaller 不在此列 —— build.bat 打包时会自行安装，
+# 注意：打包工具 PyInstaller 不在此列 —— build*.bat 打包时会自行安装，
 #       只想跑源码的人不需要它。
 # ---------------------------------------------------------------------------
 
@@ -22,9 +23,12 @@ pycryptodome>=3.17,<4.0
 # Win32 API 绑定：命名管道、注册表、ShellExecuteExW
 pywin32>=306; sys_platform == "win32"
 
-# GUI 组件库。实测 6.0.0：CTkTextbox 没有 tag_config，
-# gui.py 走的是 _textbox 内部接口兜底，不保证与 5.x 行为一致
-customtkinter>=6.0,<7.0
+# GUI 组件库（Flet 版）。锁 1.0.x：1.0 相对 0.28 是破坏性大版本，
+# gui_flet.py 按 1.0 API 编写（page.run_thread / show_dialog / ft.run 等）
+flet>=1.0,<2.0
 
-# 二维码 png 解码与 CTkImage 渲染
+# 启动动画视频播放（flet 官方扩展，1.0.x 与 flet 1.0 配套）
+flet-video>=1.0,<2.0
+
+# 二维码 png 显示与验证码图合成
 pillow>=10.0,<13.0
