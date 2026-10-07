@@ -84,4 +84,4 @@ STOVE 的账密登录在服务端会要求**交互式人机验证码**（点选�
 
 ## 许可
 
-GNU General Public License v3.0，见 [LICENSE](LICENSE)。
+GNU General Public License v3.0，见 [LICENSE](LICENSE)。assets 目录内素材遵循各自独立协议，不属于本项目作者所有
