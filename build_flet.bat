@@ -42,8 +42,6 @@ echo [3/3] placing config files...
 copy /y config.json dist\czn-lite-flet\ >nul
 mkdir dist\czn-lite-flet\assets\videos >nul 2>nul
 copy /y assets\videos\*.mp4 dist\czn-lite-flet\assets\videos\ >nul
-ideos\*.mp4 dist\czn-lite-fletssets
-ideos\ >nul
 echo [+] DONE: dist\czn-lite-flet\czn-lite-flet.exe
 echo     distribution = zip the dist folder and send it
 pause
