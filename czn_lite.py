@@ -236,9 +236,8 @@ CLIENT_ID = _cfg("platform", "client_id", default=(
     "5faa0926311687ccc34a598d9640a48909a86a0e93afdf586ab088a3d01a93d3"))
 # 启动器版本串：随 STOVE 客户端版本更新，STOVE 升级后改配置即可
 CALLER_ID = _cfg("platform", "caller_id", default="STOVE_LAUNCHER_VER.3.2.28.733")
-# 游戏主程序相对路径：文件名为游戏写死常量，仅目录随设备变化。
-# 不经 ucldr loader —— 实测 loader 只是官方启动器激活保护的中间层，
-# 管道服务就绪后直接起主程序即可进游戏，环境变量通道完全一致。
+# 游戏主程序相对路径：文件名是写死常量，目录随设备变化。
+# 不经 ucldr loader —— 它只是官方激活保护的中间层，管道就绪后直接起主程序即可。
 GAME_EXE_REL = _cfg("game", "game_exe",
                     default=r"bin\ssr-stove-shield.exe")
 
@@ -924,10 +923,8 @@ def normalize_install_root(raw):
 def game_exe_probe(root, exe_rel=None):
     """检查 root 下是否有游戏主程序。返回 (是否存在, 完整路径)。
 
-    精确路径即可 —— Windows 文件系统不区分大小写，配置里写哪种大小写都能命中。
-
-    exe_rel 必须运行时取全局：默认参数在 def 时就绑死了，玩家改了
-    config 里的 game.game_exe 也不会生效。
+    文件系统不区分大小写。exe_rel 运行时取全局 —— 默认参数在 def 时就绑死了，
+    改了 config 里的 game.game_exe 不会生效。
     """
     if not root:
         return False, "install_root 为空"
@@ -936,7 +933,7 @@ def game_exe_probe(root, exe_rel=None):
 
 
 def game_exe_name():
-    """主程序文件名，供界面文案使用（随 game.game_exe 变化，不写死）。"""
+    """主程序文件名，供界面文案使用。"""
     return os.path.basename(GAME_EXE_REL)
 
 
@@ -2325,17 +2322,11 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 
 
 def launch_game(env, wait_seconds=12):
-    """直接拉起游戏主程序（不经 ucldr loader）。
+    """直接拉起游戏主程序（不经 ucldr loader，它只是官方激活保护的中间层）。
 
-    loader 只是官方启动器为激活保护加的中间层：管道服务已经在本进程里
-    开着，环境变量也已就位，主程序自己会连管道取 REQUIRED_INFO。
-
-    首选 ShellExecuteExW（与官方启动方式一致），但它在存在残留进程
-    或触发隐藏对话框时可能永久阻塞（调用线程没有消息泵），因此：
-      · 放到临时线程执行，最多等待 wait_seconds 秒
-      · 超时后确认主程序是否其实已经启动（避免双开）
-      · 确认未启动则回退 CreateProcessW 直启（不会阻塞）
-    失败时打印 Win32 错误码便于定位。"""
+    ShellExecuteExW 在有残留进程或隐藏对话框时可能永久阻塞（本线程没有消息
+    泵），故放到临时线程限时等待；超时后先确认主程序是否已在跑（避免双开），
+    确认没跑才回退 CreateProcessW 直启。失败时打印 Win32 错误码便于定位。"""
     # 前置校验：路径不对时立刻给出可读原因，而不是抛 WinError 123
     ok, detail = game_exe_probe(INSTALL_ROOT)
     if not ok:
@@ -2359,7 +2350,7 @@ def launch_game(env, wait_seconds=12):
     sei.fMask = 0x40  # SEE_MASK_NOCLOSEPROCESS
     sei.lpVerb = "open"
     sei.lpFile = GAME_EXE_PATH
-    sei.lpParameters = None          # 主程序无参数（参数是 loader 用来指定主程序的）
+    sei.lpParameters = None          # 主程序无参数
     sei.lpDirectory = INSTALL_ROOT
     sei.nShow = 1
 
@@ -2385,9 +2376,8 @@ def launch_game(env, wait_seconds=12):
         print("[!] ShellExecuteExW %d 秒未返回（可能被残留进程或隐藏对话框阻塞）"
               % wait_seconds)
 
-    # 回退前先确认主程序是否其实已经启动，避免双开。
-    # 判据必须大小写不敏感（tasklist 按真实文件名的大小写输出），且不能
-    # 拿超过 25 字符的名字去比 —— tasklist 的 Image Name 列宽 25，长名会被截断。
+    # 回退前先确认主程序是否已在跑，避免双开。判据要大小写不敏感，且名字不能
+    # 超过 25 字符 —— tasklist 的 Image Name 列宽 25，长名会被截断。
     listing = subprocess.run(["tasklist"], capture_output=True).stdout \
         .decode("utf-8", errors="replace").lower()
     probe = os.path.basename(GAME_EXE_REL).lower()
