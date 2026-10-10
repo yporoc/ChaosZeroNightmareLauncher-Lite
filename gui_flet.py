@@ -663,9 +663,10 @@ class App:
     # ================= 游戏路径显示 =================
     def _refresh_path_display(self):
         root = cl.INSTALL_ROOT or "未配置（获取离线信息 / 选择游戏路径）"
-        ok, detail = cl.loader_probe(cl.INSTALL_ROOT)
-        mark = "✓ loader 存在" if ok else ("✗ loader 缺失" if cl.INSTALL_ROOT
-                                           else "")
+        ok, detail = cl.game_exe_probe(cl.INSTALL_ROOT)
+        exe_name = cl.game_exe_name()
+        mark = ("✓ %s 存在" % exe_name) if ok else (
+            ("✗ %s 缺失" % exe_name) if cl.INSTALL_ROOT else "")
         self.path_text.value = "%s\n%s" % (root, mark) if mark else root
         self.path_text.color = C_FG if ok else C_DIM
         self.path_text.update()
@@ -1089,7 +1090,7 @@ class App:
 
     # ---- 前置条件检查 (三种登录任务共用; 全部打印到日志) ----
     def _precondition_report(self) -> dict:
-        """打印并返回前置条件状态。装路径/loader 是启动硬条件, 凭据是续期硬条件。"""
+        """打印并返回前置条件状态。装路径/主程序是启动硬条件, 凭据是续期硬条件。"""
         st_ok = cl.STATE_FILE.exists()
         has_rt = False
         if st_ok:
@@ -1098,16 +1099,17 @@ class App:
                 has_rt = bool(_st.get("launcher_refresh"))
             except Exception as e:
                 self.log_line("[dbg]   state.json 读取失败: %s" % e)
-        loader_ok = cl.loader_probe(cl.INSTALL_ROOT)[0]
+        exe_ok = cl.game_exe_probe(cl.INSTALL_ROOT)[0]
         self.log_line("[*] 前置条件检查:")
         self.log_line("[dbg]   state.json    : %s" % ("存在" if st_ok else "缺失"))
         self.log_line("[dbg]   refresh_token : %s" % ("有" if has_rt else "无"))
         self.log_line("[dbg]   install_root  : %s" % (cl.INSTALL_ROOT or "未配置(先获取离线信息)"))
-        self.log_line("[dbg]   loader        : %s" % ("存在 ✓" if loader_ok else "缺失 ✗"))
+        self.log_line("[dbg]   %s : %s" % (cl.game_exe_name(),
+                                           "存在 ✓" if exe_ok else "缺失 ✗"))
         if cl.NET_PREFLIGHT:
             ok, detail = cl.preflight()
             self.log_line("[%s] 网络预检: %s" % ("+" if ok else "!", detail))
-        return {"state": st_ok, "refresh": has_rt, "loader": loader_ok}
+        return {"state": st_ok, "refresh": has_rt, "game_exe": exe_ok}
 
     # ---- 任务 1: 续期 (仅续期: 必须已有本地凭据, 与扫码登录职责分离) ----
     def _task_renew(self):
@@ -1232,10 +1234,11 @@ class App:
             self.set_status("状态: 游戏已在大厅/运行中")
             return
         pre = self._precondition_report()
-        if not pre["loader"]:
-            self.log_line("[x] 游戏安装路径/loader 缺失 —— 请先点『获取离线信息』探测, "
-                          "点『选择游戏路径』手动指定, 或改 config.json → game.install_root")
-            self.set_status("状态: loader 缺失")
+        if not pre["game_exe"]:
+            self.log_line("[x] 游戏安装路径/%s 缺失 —— 请先点『获取离线信息』探测, "
+                          "点『选择游戏路径』手动指定, 或改 config.json → game.install_root"
+                          % cl.game_exe_name())
+            self.set_status("状态: %s 缺失" % cl.game_exe_name())
             return
         auth = cl.StoveAuth()
         if auth.load():
@@ -1313,7 +1316,7 @@ class App:
 
         self.set_status("状态: 拉起游戏…")
         if cl.launch_game(env):
-            self.log_line("[+] 游戏已拉起 (经 ucldr loader)")
+            self.log_line("[+] 游戏已拉起 (直接启动主程序)")
             self.log_line("[dbg] 成功判据: %%LOCALAPPDATA%%\\STOVEPCSDK3\\logs\\"
                           "STOVE_CHAOSZERO\\BaseSDK_*.log 出现 Base_SetGameProfileCpp")
             self.set_status("状态: 游戏运行中 (管道保活中)")
@@ -1345,7 +1348,7 @@ class App:
         self.log_line("[+] 离线信息已写入 json: %s" % cl.STATE_FILE)
         for k, v in info.items():
             self.log_line("[dbg]   %s = %s" % (k, v))
-        if "install_root_detected" in info and not info.get("loader_found"):
+        if "install_root_detected" in info and not info.get("game_exe_found"):
             # ★ 换设备自主适配: 探测到安装路径 → 写入 config.json 并即时生效
             root = info["install_root_detected"]
             if not root:
@@ -1357,8 +1360,9 @@ class App:
             self.log_line("[*] 检测到安装路径: %s —— 写入 config.json" % root)
             try:
                 cl.set_install_root(root)
-                self.log_line("[+] 已写入并即时生效 (loader %s)"
-                              % ("存在" if os.path.exists(cl.LOADER_EXE) else "仍缺失"))
+                self.log_line("[+] 已写入并即时生效 (%s %s)"
+                              % (cl.game_exe_name(),
+                                 "存在" if os.path.exists(cl.GAME_EXE_PATH) else "仍缺失"))
             except Exception as e:
                 self.log_line("[x] 写入 config.json 失败：%s" % e)
         self.q.put(("path", None))
@@ -1594,7 +1598,7 @@ class App:
 
         FilePicker.get_directory_path() 在 Windows 桌面端调起的就是系统
         原生目录选择对话框。选定后经 normalize_install_root 规范化（容忍
-        指到 bin/ 或 exe），loader 校验，写回 config.json 即时生效。
+        指到 bin/ 或 exe），主程序校验，写回 config.json 即时生效。
         """
         if self._busy.is_set():
             self.log_line("[!] 已有任务在运行, 请先停止")
@@ -1614,17 +1618,18 @@ class App:
         root, notes = cl.normalize_install_root(path)
         for n in notes:
             self.log_line("[dbg]   %s" % n)
-        ok, detail = cl.loader_probe(root)
+        ok, detail = cl.game_exe_probe(root)
         if not ok:
-            self.log_line("[!] 该目录下未找到 loader（%s）—— 仍将写入配置；"
-                          "请确认选的是包含 bin 子目录的那一层" % detail)
+            self.log_line("[!] 该目录下未找到 %s（%s）—— 仍将写入配置；"
+                          "请确认选的是包含 bin 子目录的那一层"
+                          % (cl.game_exe_name(), detail))
         try:
             cl.set_install_root(root)
         except Exception as exc:
             self.log_line("[x] 写入 config.json 失败：%s" % exc)
             return
-        self.log_line("[+] 游戏路径已设定: %s (loader %s)"
-                      % (root, "存在 ✓" if ok else "缺失 ✗"))
+        self.log_line("[+] 游戏路径已设定: %s (%s %s)"
+                      % (root, cl.game_exe_name(), "存在 ✓" if ok else "缺失 ✗"))
         self.set_status("状态: 游戏路径已设定")
         self._refresh_path_display()
 
