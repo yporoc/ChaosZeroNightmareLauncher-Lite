@@ -22,7 +22,7 @@ r"""czn-lite —— Chaos Zero Nightmare（STOVE 版）第三方精简启动器�
                  → POST /gc/v1.4/check 换取 384 字符游戏级令牌
   2. pipesrv   命名管道 \\.\pipe\{GUID}\STOVE_CHAOSZERO 服务端
                  握手 1000 → 2000(RSA) → 2001(AES)，心跳 1001 只收不应答
-  3. launch    组装 31 个环境变量，经 ucldr loader 拉起游戏进程
+  3. launch    组装 31 个环境变量，直接拉起游戏主程序 exe
   4. keepalive 游戏运行期间由本进程内的管道服务保活
 
 安全声明：仅供个人学习研究。仅支持二维码登录，不接触密码；
@@ -118,8 +118,8 @@ def _repair_path_values(text):
     静默解析成 `D:<退格>in`。这里只补单独的反斜杠（已配对的 \\\\ 不动），
     因此可无条件先跑；只动已知路径键，help_text 里的 \\n 绝不能碰。
     """
-    keys = ("install_root", "loader_exe", "loader_args", "game_path",
-            "install_path", "path", "working_dir")
+    keys = ("install_root", "game_exe", "loader_exe", "loader_args",
+            "game_path", "install_path", "path", "working_dir")
     pat = re.compile(r'"(%s)"(\s*:\s*)"([^"]*)"' % "|".join(keys))
 
     def _fix(m):
@@ -236,10 +236,11 @@ CLIENT_ID = _cfg("platform", "client_id", default=(
     "5faa0926311687ccc34a598d9640a48909a86a0e93afdf586ab088a3d01a93d3"))
 # 启动器版本串：随 STOVE 客户端版本更新，STOVE 升级后改配置即可
 CALLER_ID = _cfg("platform", "caller_id", default="STOVE_LAUNCHER_VER.3.2.28.733")
-# loader 相对路径与参数：文件名为游戏写死常量，仅目录随设备变化
-LOADER_REL = _cfg("game", "loader_exe",
-                  default=r"bin\ucldr_chaoszeronightmare_gl_loader_x64.exe")
-LOADER_ARGS = _cfg("game", "loader_args", default=r"bin\ssr-stove-shield.exe")
+# 游戏主程序相对路径：文件名为游戏写死常量，仅目录随设备变化。
+# 不经 ucldr loader —— 实测 loader 只是官方启动器激活保护的中间层，
+# 管道服务就绪后直接起主程序即可进游戏，环境变量通道完全一致。
+GAME_EXE_REL = _cfg("game", "game_exe",
+                    default=r"bin\ssr-stove-shield.exe")
 
 
 # ====================================================================
@@ -890,8 +891,8 @@ def _record_api(tag, status, data):
 
 # ---- 路径规范化与校验 ----
 # 用户填 install_root 的方式千奇百怪：正斜杠、尾部多一个反斜杠、带引号、
-# 指到 bin 子目录、甚至直接指到 loader exe。这里统一收敛成「游戏根目录」。
-def normalize_install_root(raw, loader_rel=LOADER_REL):
+# 指到 bin 子目录、甚至直接指到某个 exe。这里统一收敛成「游戏根目录」。
+def normalize_install_root(raw):
     """把各种写法统一成游戏根目录。返回 (路径, 说明列表)。"""
     notes = []
     if not raw:
@@ -920,16 +921,18 @@ def normalize_install_root(raw, loader_rel=LOADER_REL):
     return norm, notes
 
 
-def loader_probe(root, loader_rel=LOADER_REL):
-    """检查 root 下是否有 loader。返回 (是否存在, 完整路径)。
+def game_exe_probe(root, exe_rel=None):
+    """检查 root 下是否有游戏主程序。返回 (是否存在, 完整路径)。
 
-    用精确路径即可 —— Windows 文件系统不区分大小写：实测官方文件名是
-    `ucldr_ChaosZeroNightmare_GL_loader_x64.exe`，与 config 默认值的大小写
-    不同，但 os.path.exists 仍能命中。
+    用精确路径即可 —— Windows 文件系统不区分大小写：实测官方文件名大小写
+    与配置默认值不同（`ssr-stove-shield.exe` 同理），os.path.exists 仍能命中。
+
+    exe_rel 必须运行时取全局：默认参数在 def 时就绑死了，玩家改了
+    config 里的 game.game_exe 也不会生效。
     """
     if not root:
         return False, "install_root 为空"
-    exe = os.path.join(root, loader_rel)
+    exe = os.path.join(root, exe_rel or GAME_EXE_REL)
     return os.path.exists(exe), exe
 
 
@@ -951,17 +954,17 @@ def detect_install_root_from_registry():
     if not gp:
         return "", "注册表 GamePath 为空"
     gp, _n = normalize_install_root(gp)
-    ok, detail = loader_probe(gp)
+    ok, detail = game_exe_probe(gp)
     if ok:
         return gp, "注册表 %s\\GamePath" % sub
-    return "", "注册表 GamePath=%r 下未找到 loader（%s）" % (gp, detail)
+    return "", "注册表 GamePath=%r 下未找到游戏主程序（%s）" % (gp, detail)
 
 
 # ---- 本机动态值（换设备会变，源码不给默认值） ----
 INSTALL_ROOT_RAW = _cfg("game", "install_root", default="")
 INSTALL_ROOT, _ROOT_NOTES = normalize_install_root(INSTALL_ROOT_RAW)
 CONFIG_NOTES.extend(_ROOT_NOTES)
-LOADER_EXE = os.path.join(INSTALL_ROOT, LOADER_REL) if INSTALL_ROOT else LOADER_REL
+GAME_EXE_PATH = os.path.join(INSTALL_ROOT, GAME_EXE_REL) if INSTALL_ROOT else GAME_EXE_REL
 
 # 账号服务区（gds）：官方上报的是它检测到的出口地区；直连场景下没有
 # 「可检测的服务区」，因此取账号服务区（默认 JP），可在 config.json 调整。
@@ -1112,8 +1115,8 @@ def collect_local_info():
     """零联网采集本机与本账号可发现的固有信息（全部只读）。
 
     采集内容：MachineGuid、CallerDetail、官方日志中的账号固有字段、
-    安装路径与 loader 存在性；loader 未命中时在固定盘符的常见层级做
-    有界探测（loader 文件名是游戏写死常量，跨设备可靠）。"""
+    安装路径与游戏主程序存在性；主程序未命中时在固定盘符的常见层级做
+    有界探测（主程序文件名是游戏写死常量，跨设备可靠）。"""
     info = {}
     machine_guid_value = machine_guid()
     if machine_guid_value:
@@ -1132,8 +1135,8 @@ def collect_local_info():
                 info[key] = log_data[key]
 
     info["install_root"] = INSTALL_ROOT
-    info["loader_found"] = os.path.exists(LOADER_EXE)
-    if not info["loader_found"]:
+    info["game_exe_found"] = os.path.exists(GAME_EXE_PATH)
+    if not info["game_exe_found"]:
         detected, trace = detect_install_root()
         if not detected:
             trace.append("全部失败 —— 需在 config.json 里设置 game.install_root")
@@ -1167,19 +1170,21 @@ def detect_install_root():
             drives.append(letter + ":")
     trace.append("可用盘符: %s" % drives)
 
+    exe_name = os.path.basename(GAME_EXE_REL)
+    trace.append("探测目标: bin\\%s" % exe_name)
     patterns = [
-        r"{d}\ChaosZeroNightmare\bin\ucldr_*.exe",
-        r"{d}\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
-        r"{d}\Games\*\bin\ucldr_chaos*.exe",
-        r"{d}\*\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
-        r"{d}\*\*\Games\ChaosZeroNightmare\bin\ucldr_*.exe",
-        r"{d}\*\Games\*\bin\ucldr_*.exe",
-        r"{d}\Games\*\*\bin\ucldr_*.exe",
-        r"{d}\SteamLibrary\steamapps\common\ChaosZeroNightmare\bin\ucldr_*.exe",
+        r"{d}\ChaosZeroNightmare\bin\{e}",
+        r"{d}\Games\ChaosZeroNightmare\bin\{e}",
+        r"{d}\Games\*\bin\{e}",
+        r"{d}\*\Games\ChaosZeroNightmare\bin\{e}",
+        r"{d}\*\*\Games\ChaosZeroNightmare\bin\{e}",
+        r"{d}\*\Games\*\bin\{e}",
+        r"{d}\Games\*\*\bin\{e}",
+        r"{d}\SteamLibrary\steamapps\common\ChaosZeroNightmare\bin\{e}",
     ]
     for tpl in patterns:
         for d in drives:
-            pat = tpl.format(d=d)
+            pat = tpl.format(d=d, e=exe_name)
             try:
                 hits = glob.glob(pat)
             except Exception as e:
@@ -1212,9 +1217,9 @@ def set_install_root(root):
     data.setdefault("game", {})["install_root"] = root
     _CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                             encoding="utf-8")
-    global INSTALL_ROOT, LOADER_EXE
+    global INSTALL_ROOT, GAME_EXE_PATH
     INSTALL_ROOT = root
-    LOADER_EXE = os.path.join(root, LOADER_REL) if root else LOADER_REL
+    GAME_EXE_PATH = os.path.join(root, GAME_EXE_REL) if root else GAME_EXE_REL
     return root
 
 
@@ -2316,20 +2321,23 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
 
 
 def launch_game(env, wait_seconds=12):
-    """通过 ucldr loader 拉起游戏。
+    """直接拉起游戏主程序（不经 ucldr loader）。
 
-    首选 ShellExecuteExW（与官方启动方式一致），但它在存在残留 loader
+    loader 只是官方启动器为激活保护加的中间层：管道服务已经在本进程里
+    开着，环境变量也已就位，主程序自己会连管道取 REQUIRED_INFO。
+
+    首选 ShellExecuteExW（与官方启动方式一致），但它在存在残留进程
     或触发隐藏对话框时可能永久阻塞（调用线程没有消息泵），因此：
       · 放到临时线程执行，最多等待 wait_seconds 秒
-      · 超时后检查 loader/游戏是否其实已经启动（避免双开）
+      · 超时后确认主程序是否其实已经启动（避免双开）
       · 确认未启动则回退 CreateProcessW 直启（不会阻塞）
     失败时打印 Win32 错误码便于定位。"""
     # 前置校验：路径不对时立刻给出可读原因，而不是抛 WinError 123
-    ok, detail = loader_probe(INSTALL_ROOT, LOADER_REL)
+    ok, detail = game_exe_probe(INSTALL_ROOT)
     if not ok:
-        print("[x] 无法拉起：游戏目录未配置或 loader 不存在")
+        print("[x] 无法拉起：游戏目录未配置或游戏主程序不存在")
         print("    install_root = %r" % INSTALL_ROOT)
-        print("    期望 loader  = %s" % detail)
+        print("    期望主程序   = %s" % detail)
         if INSTALL_ROOT:
             print("    该目录存在   = %s" % os.path.isdir(INSTALL_ROOT))
             print("    其下 bin     = %s"
@@ -2346,8 +2354,8 @@ def launch_game(env, wait_seconds=12):
     sei.cbSize = ctypes.sizeof(sei)
     sei.fMask = 0x40  # SEE_MASK_NOCLOSEPROCESS
     sei.lpVerb = "open"
-    sei.lpFile = LOADER_EXE
-    sei.lpParameters = LOADER_ARGS
+    sei.lpFile = GAME_EXE_PATH
+    sei.lpParameters = None          # 主程序无参数（参数是 loader 用来指定主程序的）
     sei.lpDirectory = INSTALL_ROOT
     sei.nShow = 1
 
@@ -2373,40 +2381,41 @@ def launch_game(env, wait_seconds=12):
         print("[!] ShellExecuteExW %d 秒未返回（可能被残留进程或隐藏对话框阻塞）"
               % wait_seconds)
 
-    # 回退前先确认 loader / 游戏是否其实已经启动，避免双开
+    # 回退前先确认主程序是否其实已经启动，避免双开。
+    # 判据必须大小写不敏感（tasklist 按真实文件名的大小写输出），且不能
+    # 拿超过 25 字符的名字去比 —— tasklist 的 Image Name 列宽 25，长名会被截断。
     listing = subprocess.run(["tasklist"], capture_output=True).stdout \
-        .decode("utf-8", errors="replace")
-    for probe in ("ucldr_chaos", "ssr-stove-shield"):
-        if probe in listing:
-            print("[+] 检测到 %s 已在运行，视为已拉起" % probe)
-            return True
+        .decode("utf-8", errors="replace").lower()
+    probe = os.path.basename(GAME_EXE_REL).lower()
+    if probe in listing:
+        print("[+] 检测到 %s 已在运行，视为已拉起" % probe)
+        return True
 
     try:
         # cwd 必须是非空有效目录：空串会抛 OSError WinError 123
-        process = subprocess.Popen([LOADER_EXE, LOADER_ARGS],
+        process = subprocess.Popen([GAME_EXE_PATH],
                                    cwd=INSTALL_ROOT or None)
         print("[launch] 游戏进程已创建（CreateProcessW，pid=%s）" % process.pid)
         return True
     except Exception as e:
-        print("[x] 拉起失败：%s（file=%s args=%s dir=%s）"
-              % (e, LOADER_EXE, LOADER_ARGS, INSTALL_ROOT))
+        print("[x] 拉起失败：%s（file=%s dir=%s）"
+              % (e, GAME_EXE_PATH, INSTALL_ROOT))
         return False
 
 
 def launch_game_capture_stdout(env, out_path=None):
-    """诊断用：以 CreateProcessW 启动 loader 并重定向 stdout/stderr 到文件。
-    注意 loader 会脱离重定向启动游戏，因此游戏自身日志可能仍不可见。"""
+    """诊断用：以 CreateProcessW 启动游戏主程序并重定向 stdout/stderr 到文件。"""
     for key, value in env.items():
         if value is not None:
             os.environ[key] = str(value)
     out_path = out_path or str(Path(__file__).with_name("game_stdout.log"))
     log = open(out_path, "wb")
     print("[launch] 诊断模式：stdout/stderr → %s" % out_path)
-    process = subprocess.Popen([LOADER_EXE, LOADER_ARGS],
+    process = subprocess.Popen([GAME_EXE_PATH],
                                cwd=INSTALL_ROOT or None,
                                stdout=log, stderr=subprocess.STDOUT,
                                stdin=subprocess.DEVNULL)
-    print("[launch] loader pid=%s" % process.pid)
+    print("[launch] 主程序 pid=%s" % process.pid)
     return process
 
 
@@ -2638,9 +2647,9 @@ def dry_run():
     win32file.CloseHandle(handle)
     server.running = False
     print("[+] 管道握手自测 OK（1000→2000→2001，1001 只收不应答）")
-    print("[+] ShellExecute 参数：file=%s params=%s dir=%s"
-          % (LOADER_EXE, LOADER_ARGS, INSTALL_ROOT))
-    print("[+] loader 存在：%s" % os.path.exists(LOADER_EXE))
+    print("[+] ShellExecute 参数：file=%s dir=%s（主程序无参数）"
+          % (GAME_EXE_PATH, INSTALL_ROOT))
+    print("[+] 游戏主程序存在：%s" % os.path.exists(GAME_EXE_PATH))
     print("=== DRY RUN PASS ===")
 
 
@@ -2757,7 +2766,7 @@ def main():
     if args.capture_stdout:
         launch_game_capture_stdout(env)
     elif launch_game(env):
-        print("[+] 游戏已拉起（经 ucldr loader）")
+        print("[+] 游戏已拉起（直接启动主程序）")
     else:
         print("[-] 拉起失败")
         return
