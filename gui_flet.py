@@ -664,8 +664,9 @@ class App:
     def _refresh_path_display(self):
         root = cl.INSTALL_ROOT or "未配置（获取离线信息 / 选择游戏路径）"
         ok, detail = cl.game_exe_probe(cl.INSTALL_ROOT)
-        mark = "✓ 主程序存在" if ok else ("✗ 主程序缺失" if cl.INSTALL_ROOT
-                                           else "")
+        exe_name = cl.game_exe_name()
+        mark = ("✓ %s 存在" % exe_name) if ok else (
+            ("✗ %s 缺失" % exe_name) if cl.INSTALL_ROOT else "")
         self.path_text.value = "%s\n%s" % (root, mark) if mark else root
         self.path_text.color = C_FG if ok else C_DIM
         self.path_text.update()
@@ -1103,7 +1104,8 @@ class App:
         self.log_line("[dbg]   state.json    : %s" % ("存在" if st_ok else "缺失"))
         self.log_line("[dbg]   refresh_token : %s" % ("有" if has_rt else "无"))
         self.log_line("[dbg]   install_root  : %s" % (cl.INSTALL_ROOT or "未配置(先获取离线信息)"))
-        self.log_line("[dbg]   游戏主程序    : %s" % ("存在 ✓" if exe_ok else "缺失 ✗"))
+        self.log_line("[dbg]   %s : %s" % (cl.game_exe_name(),
+                                           "存在 ✓" if exe_ok else "缺失 ✗"))
         if cl.NET_PREFLIGHT:
             ok, detail = cl.preflight()
             self.log_line("[%s] 网络预检: %s" % ("+" if ok else "!", detail))
@@ -1233,9 +1235,10 @@ class App:
             return
         pre = self._precondition_report()
         if not pre["game_exe"]:
-            self.log_line("[x] 游戏安装路径/主程序缺失 —— 请先点『获取离线信息』探测, "
-                          "点『选择游戏路径』手动指定, 或改 config.json → game.install_root")
-            self.set_status("状态: 游戏主程序缺失")
+            self.log_line("[x] 游戏安装路径/%s 缺失 —— 请先点『获取离线信息』探测, "
+                          "点『选择游戏路径』手动指定, 或改 config.json → game.install_root"
+                          % cl.game_exe_name())
+            self.set_status("状态: %s 缺失" % cl.game_exe_name())
             return
         auth = cl.StoveAuth()
         if auth.load():
@@ -1357,8 +1360,9 @@ class App:
             self.log_line("[*] 检测到安装路径: %s —— 写入 config.json" % root)
             try:
                 cl.set_install_root(root)
-                self.log_line("[+] 已写入并即时生效 (主程序 %s)"
-                              % ("存在" if os.path.exists(cl.GAME_EXE_PATH) else "仍缺失"))
+                self.log_line("[+] 已写入并即时生效 (%s %s)"
+                              % (cl.game_exe_name(),
+                                 "存在" if os.path.exists(cl.GAME_EXE_PATH) else "仍缺失"))
             except Exception as e:
                 self.log_line("[x] 写入 config.json 失败：%s" % e)
         self.q.put(("path", None))
@@ -1616,15 +1620,16 @@ class App:
             self.log_line("[dbg]   %s" % n)
         ok, detail = cl.game_exe_probe(root)
         if not ok:
-            self.log_line("[!] 该目录下未找到游戏主程序（%s）—— 仍将写入配置；"
-                          "请确认选的是包含 bin 子目录的那一层" % detail)
+            self.log_line("[!] 该目录下未找到 %s（%s）—— 仍将写入配置；"
+                          "请确认选的是包含 bin 子目录的那一层"
+                          % (cl.game_exe_name(), detail))
         try:
             cl.set_install_root(root)
         except Exception as exc:
             self.log_line("[x] 写入 config.json 失败：%s" % exc)
             return
-        self.log_line("[+] 游戏路径已设定: %s (主程序 %s)"
-                      % (root, "存在 ✓" if ok else "缺失 ✗"))
+        self.log_line("[+] 游戏路径已设定: %s (%s %s)"
+                      % (root, cl.game_exe_name(), "存在 ✓" if ok else "缺失 ✗"))
         self.set_status("状态: 游戏路径已设定")
         self._refresh_path_display()
 

@@ -924,8 +924,7 @@ def normalize_install_root(raw):
 def game_exe_probe(root, exe_rel=None):
     """检查 root 下是否有游戏主程序。返回 (是否存在, 完整路径)。
 
-    用精确路径即可 —— Windows 文件系统不区分大小写：实测官方文件名大小写
-    与配置默认值不同（`ssr-stove-shield.exe` 同理），os.path.exists 仍能命中。
+    精确路径即可 —— Windows 文件系统不区分大小写，配置里写哪种大小写都能命中。
 
     exe_rel 必须运行时取全局：默认参数在 def 时就绑死了，玩家改了
     config 里的 game.game_exe 也不会生效。
@@ -934,6 +933,11 @@ def game_exe_probe(root, exe_rel=None):
         return False, "install_root 为空"
     exe = os.path.join(root, exe_rel or GAME_EXE_REL)
     return os.path.exists(exe), exe
+
+
+def game_exe_name():
+    """主程序文件名，供界面文案使用（随 game.game_exe 变化，不写死）。"""
+    return os.path.basename(GAME_EXE_REL)
 
 
 def detect_install_root_from_registry():
@@ -1171,7 +1175,7 @@ def detect_install_root():
     trace.append("可用盘符: %s" % drives)
 
     exe_name = os.path.basename(GAME_EXE_REL)
-    trace.append("探测目标: bin\\%s" % exe_name)
+    trace.append("探测目标: %s" % GAME_EXE_REL)
     patterns = [
         r"{d}\ChaosZeroNightmare\bin\{e}",
         r"{d}\Games\ChaosZeroNightmare\bin\{e}",
@@ -2335,9 +2339,9 @@ def launch_game(env, wait_seconds=12):
     # 前置校验：路径不对时立刻给出可读原因，而不是抛 WinError 123
     ok, detail = game_exe_probe(INSTALL_ROOT)
     if not ok:
-        print("[x] 无法拉起：游戏目录未配置或游戏主程序不存在")
+        print("[x] 无法拉起：游戏目录未配置或 %s 不存在" % game_exe_name())
         print("    install_root = %r" % INSTALL_ROOT)
-        print("    期望主程序   = %s" % detail)
+        print("    期望 %s = %s" % (game_exe_name(), detail))
         if INSTALL_ROOT:
             print("    该目录存在   = %s" % os.path.isdir(INSTALL_ROOT))
             print("    其下 bin     = %s"
@@ -2649,7 +2653,7 @@ def dry_run():
     print("[+] 管道握手自测 OK（1000→2000→2001，1001 只收不应答）")
     print("[+] ShellExecute 参数：file=%s dir=%s（主程序无参数）"
           % (GAME_EXE_PATH, INSTALL_ROOT))
-    print("[+] 游戏主程序存在：%s" % os.path.exists(GAME_EXE_PATH))
+    print("[+] %s 存在：%s" % (game_exe_name(), os.path.exists(GAME_EXE_PATH)))
     print("=== DRY RUN PASS ===")
 
 
