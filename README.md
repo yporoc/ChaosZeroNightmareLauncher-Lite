@@ -79,9 +79,10 @@ STOVE 的账密登录在服务端会要求**交互式人机验证码**（点选�
 
 ## 构建
 
-```
-双击运行 build_flet.bat
-```
+1. 取 Flet 桌面客户端放到 `vendor\flet-windows.zip`（随包分发，干净机器首跑因此不需联网）：
+   `https://github.com/flet-dev/flet/releases/download/v1.0.3/flet-windows.zip`
+   SHA256 `b92a6905b948b9a565e2163d8a3c878cd0499a7997bc0ef37b7c4cac9eae6bff`
+2. 双击运行 `build_flet.bat`
 
 ## 许可
 

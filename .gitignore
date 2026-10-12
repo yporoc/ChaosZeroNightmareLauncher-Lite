@@ -23,3 +23,6 @@ dist_new/
 # PyInstaller spec 可由 build_flet.bat 重新生成
 czn-lite-gui.spec
 czn-lite-flet.spec
+
+# 随包 Flet 桌面客户端（build_flet.bat 的输入，40 MB 二进制，不入库）
+vendor/
