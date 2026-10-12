@@ -5,14 +5,26 @@ rem  usage:  build_flet.bat          -> onedir (recommended)
 rem  output: dist\czn-lite-flet\czn-lite-flet.exe
 rem  NOTE: config.json is copied next to the exe automatically.
 rem  NOTE: this file MUST stay pure ASCII (cmd mis-parses UTF-8).
-rem  NOTE: EXPERIMENTAL - Flet 1.0 desktop client binaries are
-rem        downloaded to a local cache on first run; a machine
-rem        without network needs that cache copied manually.
+rem  NOTE: OFFLINE BY DESIGN - the Flet 1.0 desktop client (flet-windows.zip)
+rem        is bundled into _internal\flet_desktop\app\ so a clean machine never
+rem        downloads it. Put the artifact at vendor\flet-windows.zip first:
+rem          https://github.com/flet-dev/flet/releases/download/v1.0.3/flet-windows.zip
+rem          sha256 b92a6905b948b9a565e2163d8a3c878cd0499a7997bc0ef37b7c4cac9eae6bff
 rem ============================================================
 setlocal
 cd /d "%~dp0"
 
 echo === czn-lite FLET GUI build ===
+
+set FLET_VER=1.0.3
+if not exist vendor\flet-windows.zip (
+    echo [x] missing vendor\flet-windows.zip - the package would need network on first run.
+    echo     download it from:
+    echo       https://github.com/flet-dev/flet/releases/download/v%FLET_VER%/flet-windows.zip
+    echo     and put it at vendor\flet-windows.zip, then run this script again.
+    pause
+    exit /b 1
+)
 
 where py >nul 2>nul
 if errorlevel 1 (
@@ -30,7 +42,7 @@ if errorlevel 1 (
 )
 
 echo [2/3] building (this takes 1-3 minutes)...
-set ARGS=--noconfirm --clean --windowed --name czn-lite-flet --collect-all flet --collect-all flet_desktop --collect-all flet_video --collect-all curl_cffi --exclude-module numpy --exclude-module customtkinter
+set ARGS=--noconfirm --clean --windowed --name czn-lite-flet --collect-all flet --collect-all flet_desktop --collect-all flet_video --collect-all curl_cffi --exclude-module numpy --exclude-module customtkinter --add-data "vendor\flet-windows.zip;flet_desktop/app"
 py -m PyInstaller %ARGS% gui_flet.py
 if errorlevel 1 (
     echo [x] build failed
@@ -42,6 +54,12 @@ echo [3/3] placing config files...
 copy /y config.json dist\czn-lite-flet\ >nul
 mkdir dist\czn-lite-flet\assets\videos >nul 2>nul
 copy /y assets\videos\*.mp4 dist\czn-lite-flet\assets\videos\ >nul
+if not exist dist\czn-lite-flet\_internal\flet_desktop\app\flet-windows.zip (
+    echo [x] bundled client missing in dist - package is NOT offline-capable.
+    pause
+    exit /b 1
+)
+echo [+] bundled flet client: dist\czn-lite-flet\_internal\flet_desktop\app\flet-windows.zip
 echo [+] DONE: dist\czn-lite-flet\czn-lite-flet.exe
 echo     distribution = zip the dist folder and send it
 pause
