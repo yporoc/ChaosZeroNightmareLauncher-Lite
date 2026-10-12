@@ -78,9 +78,11 @@ STOVE 的账密登录在服务端会要求**交互式人机验证码**（点选�
 界面日志**明文**（含凭据，请勿直接外发）；「导出日志」导出的是**已脱敏**的反馈日志，可直接发送。
 
 ## 构建
-`
-双击运行 `build_flet.bat`
-`
+
+```
+双击运行 build_flet.bat
+```
+
 ## 许可
 
 GNU General Public License v3.0，见 [LICENSE](LICENSE)。assets 目录内素材遵循各自独立协议，不属于本项目作者所有
