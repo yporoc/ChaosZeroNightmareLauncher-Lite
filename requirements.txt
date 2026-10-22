@@ -23,12 +23,20 @@ pycryptodome>=3.17,<4.0
 # Win32 API 绑定：命名管道、注册表、ShellExecuteExW
 pywin32>=306; sys_platform == "win32"
 
-# GUI 组件库（Flet 版）。锁 1.0.x：1.0 相对 0.28 是破坏性大版本，
-# gui_flet.py 按 1.0 API 编写（page.run_thread / show_dialog / ft.run 等）
-flet>=1.0,<2.0
+# GUI 组件库（Flet 版）+ 桌面客户端。三个钉在 1.0.3：build_flet.bat 打进包里的
+# 就是 flet v1.0.3 的 flet-windows.zip，Python 侧与 Flutter 视图必须同一个
+# release；换 vendor 里的 zip 才跟着动这里。
+# flet-desktop 不能省：缺件时打包只会 WARNING，随包客户端照样落地，
+# 死的是启动时的冻结件。
+flet==1.0.3
+flet-video==1.0.3
+flet-desktop==1.0.3
 
-# 启动动画视频播放（flet 官方扩展，1.0.x 与 flet 1.0 配套）
-flet-video>=1.0,<2.0
+# 二维码 png 显示与验证码图合成。下界 13.0：12.3.0 及更早的 28 条解码器
+# CVE 只在 13.0.0 修，而这两处吃的都是服务端下发的字节。
+pillow>=13.0,<14
 
-# 二维码 png 显示与验证码图合成
-pillow>=10.0,<13.0
+# curl_cffi 的 CA 信任库取自 certifi.where()。下界 2026.10.19：更早的版本
+# 带着 eMudhra 已吊销私钥的 emSign ECC Root CA - G3，而本程序对 onstove
+# 域名没有证书固定。
+certifi>=2026.10.19
