@@ -33,7 +33,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] ensuring pyinstaller...
+echo [1/4] checking the interpreter against requirements.txt...
+rem PyInstaller bundles whatever this interpreter already has, so the floors
+rem and the Flet pairing in requirements.txt have to be checked here -
+rem otherwise they are a comment, not a package.
+rem A missing or mismatched flet-desktop does NOT fail the build: PyInstaller
+rem only warns, --add-data still creates _internal\flet_desktop\app, and the
+rem check in step 4 passes. The frozen app dies at startup instead.
+py -c "import certifi, flet, flet_desktop, flet_video, sys; from importlib.metadata import version as V; ok = tuple(int(x) for x in V('pillow').split('.'))[:2] >= (13, 0) and tuple(int(x) for x in V('certifi').split('.')) >= (2026, 10, 19) and all(V(p) == '%FLET_VER%' for p in ('flet', 'flet-desktop', 'flet-video')); sys.exit(0 if ok else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo [x] this interpreter does not match requirements.txt:
+    echo       pillow and certifi above their floors, and
+    echo       flet, flet-desktop, flet-video all at v%FLET_VER%.
+    echo     Fix it before building:  py -m pip install -r requirements.txt
+    echo     Do not ship a package built on the wrong bundles.
+    pause
+    exit /b 1
+)
+
+echo [2/4] ensuring pyinstaller...
 py -m pip install --disable-pip-version-check --quiet pyinstaller
 if errorlevel 1 (
     echo [x] pip install pyinstaller failed - check network / proxy
@@ -41,7 +59,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] building (this takes 1-3 minutes)...
+echo [3/4] building (this takes 1-3 minutes)...
 set ARGS=--noconfirm --clean --windowed --name czn-lite-flet --collect-all flet --collect-all flet_desktop --collect-all flet_video --collect-all curl_cffi --exclude-module numpy --exclude-module customtkinter --add-data "vendor\flet-windows.zip;flet_desktop/app"
 py -m PyInstaller %ARGS% gui_flet.py
 if errorlevel 1 (
@@ -50,7 +68,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/3] placing config files...
+echo [4/4] placing config files...
 copy /y config.json dist\czn-lite-flet\ >nul
 mkdir dist\czn-lite-flet\assets\videos >nul 2>nul
 copy /y assets\videos\*.mp4 dist\czn-lite-flet\assets\videos\ >nul
